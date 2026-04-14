@@ -1,7 +1,6 @@
 # evidentum
 AI-агрегатор медицинских гайдлайнов
 
-text```
 project/
 ├── docker-compose.yml
 ├── .env
@@ -16,4 +15,3 @@ project/
     ├── main.py        # FastAPI
     ├── ui.py          # Gradio
     └── ...
-```
