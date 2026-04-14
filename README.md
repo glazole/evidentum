@@ -18,11 +18,38 @@ project/
 │   ├── models.py    # Data models
 │   └── services/
 │       ├── ingest.py
+│       ├── retriever.py
 │       └── embedder.py
 ├── data/
 │   └── raw/
 │       └── your_file.pdf # document
 ```
+
+**Краткое описание:**
+
+1. **Ingest (загрузка данных)**
+   Извлекается текст, разбивается на чанки с метаданными (источник, раздел, ссылка) и сохраняется в БД. 
+
+2. **Embeddings (векторизация)**
+   Для каждого чанка считается embedding через API (Yandex AI) и сохраняется в `pgvector`, формируя векторное представление корпуса.
+
+3. **Подготовка к поиску**
+   В базе уже есть:
+
+   * текстовые фрагменты (chunks)
+   * их embeddings
+   * привязка к источникам (РФ / ESC / AHA)
+
+4. **Retriever (поиск)**
+   Пользовательский запрос преобразуется в embedding, затем выполняется similarity search по `pgvector` для получения top-k релевантных фрагментов.
+
+---
+
+**Итого:**
+
+> документы → парсинг → чанки → embeddings → pgvector → similarity search (retriever)
+
+
 ---
 ## Первый запуск
 
@@ -50,3 +77,8 @@ docker compose exec app python -m app.services.embedder --list-documents
 ```bash
 docker compose exec app python -m app.services.embedder --document-id 1 --limit 1 --debug
 ```
+7. Тестирование эмбеддингов
+```bash
+docker compose exec app python -m app.services.retriever   "антикоагулянтная терапия при фибрилляции предсердий"   --translate-mode dual_query   --top-k 8
+```
+
