@@ -248,6 +248,8 @@ def chunk_text(
     *,
     target_chars: int = 1200,
     overlap_chars: int = 200,
+    min_chars: int = 150,
+    min_words: int = 5,
 ) -> list[dict]:
     paragraphs = split_into_paragraphs(text)
     if not paragraphs:
@@ -258,17 +260,33 @@ def chunk_text(
     current_parts: list[str] = []
     current_len = 0
 
+    def is_valid_chunk(chunk_body: str) -> bool:
+        chunk_body = chunk_body.strip()
+        if not chunk_body:
+            return False
+        if len(chunk_body) < min_chars:
+            return False
+        if len(chunk_body.split()) < min_words:
+            return False
+        return True
+
+    def append_chunk(chunk_body: str) -> None:
+        chunk_body = chunk_body.strip()
+        if not is_valid_chunk(chunk_body):
+            return
+
+        chunks.append(
+            {
+                "section_title": current_section,
+                "chunk_text": chunk_body,
+                "char_count": len(chunk_body),
+            }
+        )
+
     def flush() -> None:
         nonlocal current_parts, current_len
         chunk_body = "\n\n".join(current_parts).strip()
-        if chunk_body:
-            chunks.append(
-                {
-                    "section_title": current_section,
-                    "chunk_text": chunk_body,
-                    "char_count": len(chunk_body),
-                }
-            )
+        append_chunk(chunk_body)
         current_parts = []
         current_len = 0
 
@@ -290,13 +308,7 @@ def chunk_text(
                 if part:
                     if current_parts:
                         flush()
-                    chunks.append(
-                        {
-                            "section_title": current_section,
-                            "chunk_text": part,
-                            "char_count": len(part),
-                        }
-                    )
+                    append_chunk(part)
                 if end >= paragraph_len:
                     break
                 start = max(end - overlap_chars, start + 1)
