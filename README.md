@@ -11,7 +11,6 @@ project/
 │       └── app.conf
 ├── certbot/
 │   └── init-letsencrypt.sh
-└── app/
-    ├── main.py        # FastAPI
-    ├── ui.py          # Gradio
-    └── ...
+├── app/
+│   ├── main.py      # FastAPI
+│   └── ui.py        # Gradio
