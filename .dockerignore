@@ -1,0 +1,29 @@
+# базовое
+.gitignore
+LICENSE
+README.md
+/data
+
+# git
+.git
+.gitmodules
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.env
+
+# venv
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# misc
+*.log
+.DS_Store
