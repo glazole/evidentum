@@ -80,7 +80,7 @@ class RetrievalHit:
     char_count: int
     score: float
     distance: float
-    retrieval_source: str | None = None   # raw_query | translated_query
+    retrieval_source: list[str] | None = None   # raw_query | translated_query
     translated_chunk_text: str | None = None
     translation_detected_language: str | None = None
 
@@ -323,7 +323,7 @@ def fetch_hits_for_embedding(
                 char_count=chunk.char_count,
                 distance=dist,
                 score=score_from_distance(dist),
-                retrieval_source=retrieval_source,
+                retrieval_source=[retrieval_source],
             )
         )
     return hits
@@ -337,8 +337,22 @@ def merge_and_rerank_hits(
     for hits in hits_lists:
         for hit in hits:
             existing = best_by_chunk_id.get(hit.chunk_id)
-            if existing is None or hit.distance < existing.distance:
+
+            if existing is None:
                 best_by_chunk_id[hit.chunk_id] = hit
+                continue
+
+            # объединяем источники
+            existing_sources = set(existing.retrieval_source or [])
+            new_sources = set(hit.retrieval_source or [])
+            existing.retrieval_source = list(existing_sources | new_sources)
+
+            # если новый hit лучше — обновляем метрики и текст
+            if hit.distance < existing.distance:
+                existing.distance = hit.distance
+                existing.score = hit.score
+                existing.chunk_text = hit.chunk_text
+                existing.section_title = hit.section_title
 
     merged = list(best_by_chunk_id.values())
     merged.sort(key=lambda x: (x.distance, x.document_id, x.chunk_index))
@@ -546,10 +560,13 @@ def format_hits_for_console(result: RetrievalResult) -> str:
         text_preview = (hit.translated_chunk_text or hit.chunk_text or "").replace("\n", " ").strip()
         if len(text_preview) > 400:
             text_preview = text_preview[:400].rstrip() + "..."
+
+        sources = ",".join(hit.retrieval_source or [])
+
         lines.extend(
             [
                 "",
-                f"[{idx}] score={hit.score:.6f} distance={hit.distance:.6f} retrieval_source={hit.retrieval_source}",
+                f"[{idx}] score={hit.score:.6f} distance={hit.distance:.6f} retrieval_sources={sources}",
                 f"source_id={hit.source_id} document_id={hit.document_id} chunk_id={hit.chunk_id}",
                 f"title={hit.title}",
                 f"section={hit.section_title}",
