@@ -57,9 +57,9 @@ project/
 ```bash
 docker compose up -d --build
 ```
-2. Инициализация БД
+2. Миграции БД
 ```bash
-docker compose exec app python -c "from app.db import init_db; init_db()"
+docker compose exec app alembic upgrade head
 ```
 3. Загрука (парсинг) тестового файла (любого)
 ```bash
@@ -82,3 +82,23 @@ docker compose exec app python -m app.services.embedder --document-id 1 --limit 
 docker compose exec app python -m app.services.retriever   "антикоагулянтная терапия при фибрилляции предсердий"   --translate-mode dual_query   --top-k 8
 ```
 
+---
+## Миграции БД (Alembic)
+
+Миграции версионируют схему Postgres и расширение `pgvector`, чтобы при параллельной разработке не расходиться по структуре таблиц.
+
+### Применить миграции
+Внутри контейнера (рекомендуется):
+
+```bash
+docker compose exec app alembic upgrade head
+```
+
+### Создать новую миграцию после изменения базы данных
+
+```bash
+docker compose exec app alembic revision --autogenerate -m "describe change"
+```
+
+### Заметка про `init_db()`
+Функция `init_db()` из `app/db.py` остаётся как вспомогательная для прототипа, но для командной разработки используйте Alembic, чтобы изменения схемы фиксировались в репозитории.

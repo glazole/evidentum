@@ -4,9 +4,9 @@ services:
     container_name: mvp_db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-medguides}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       TZ: ${TZ:-Europe/Moscow}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -44,9 +44,9 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Europe/Moscow}
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-medguides}
       REDIS_URL: redis://redis:6379/0
-      APP_BASE_URL: https://${DOMAIN}
+      APP_BASE_URL: https://${DOMAIN:-localhost}
     depends_on:
       db:
         condition: service_healthy
@@ -71,10 +71,12 @@ services:
       API_BASE_URL: http://api:8000
       GRADIO_SERVER_NAME: 0.0.0.0
       GRADIO_SERVER_PORT: 7860
-      GRADIO_ROOT_PATH: /
+      GRADIO_ROOT_PATH: ""
     depends_on:
       api:
         condition: service_started
+    ports:
+      - "7860:7860"
     command: >
       sh -c "python -m app.ui"
     networks:

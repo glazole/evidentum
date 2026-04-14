@@ -1,6 +1,10 @@
 sqlalchemy>=2.0
 psycopg[binary]>=3.1
 pgvector>=0.3.0
+alembic>=1.13
+fastapi>=0.110
+uvicorn[standard]>=0.27
+gradio>=4.44,<6.0
 requests>=2.31
 beautifulsoup4>=4.12
 pypdf>=4.2
