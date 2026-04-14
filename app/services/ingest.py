@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import mimetypes
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -500,12 +499,12 @@ def ingest_many_local_files(
         results.append(result)
     return results
 
-
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ingest documents into Postgres/pgvector")
 
     parser.add_argument("--file", action="append", help="Local file path. Can be passed multiple times.")
     parser.add_argument("--url", action="append", help="Document URL. Can be passed multiple times.")
+    parser.add_argument("--dir", help="Path to directory with files.")
     parser.add_argument("--source-id", help="Override source_id for single file/url ingest.")
     parser.add_argument("--source-name", help="Override source_name for single file/url ingest.")
     parser.add_argument("--region", help="Region tag, e.g. RU / EU / US.")
@@ -521,8 +520,8 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    if not args.file and not args.url:
-        parser.error("At least one --file or --url must be provided.")
+    if not args.file and not args.url and not args.dir:
+        parser.error("At least one --file, --url, or --dir must be provided.")
 
     init_db()
 
@@ -530,6 +529,30 @@ def main() -> None:
         for file_path in args.file:
             result = ingest_file(
                 file_path=file_path,
+                source_id=args.source_id,
+                source_name=args.source_name,
+                region=args.region,
+                force_reingest=args.force_reingest,
+                target_chars=args.target_chars,
+                overlap_chars=args.overlap_chars,
+            )
+            print(result)
+
+    if args.dir:
+        dir_path = Path(args.dir)
+
+        if not dir_path.exists():
+            parser.error(f"Directory does not exist: {args.dir}")
+
+        if not dir_path.is_dir():
+            parser.error(f"Path is not a directory: {args.dir}")
+
+        for file_path in sorted(dir_path.iterdir()):
+            if not file_path.is_file():
+                continue
+
+            result = ingest_file(
+                file_path=str(file_path),
                 source_id=args.source_id,
                 source_name=args.source_name,
                 region=args.region,
