@@ -32,7 +32,7 @@ YANDEX_TRANSLATE_URL = os.getenv(
 )
 
 TRANSLATE_MODE = os.getenv("RETRIEVER_TRANSLATE_MODE", "off")
-# off | query | query_and_hits
+# off | query | query_and_hits | dual_query
 
 TRANSLATE_TARGET_LANG = os.getenv("RETRIEVER_TRANSLATE_TARGET_LANG", "ru")
 TRANSLATE_QUERY_TARGET_LANG = os.getenv("RETRIEVER_TRANSLATE_QUERY_TARGET_LANG", "en")
@@ -50,7 +50,7 @@ PERSONAL_YANDEX_API_KEY = os.getenv("PERSONAL_YANDEX_API_KEY", "")
 PERSONAL_YANDEX_IAM_TOKEN = os.getenv("PERSONAL_YANDEX_IAM_TOKEN", "")
 
 
-TranslateMode = Literal["off", "query", "query_and_hits"]
+TranslateMode = Literal["off", "query", "query_and_hits", "dual_query"]
 CredentialProfile = Literal["default", "personal"]
 
 
@@ -242,10 +242,10 @@ def contains_latin(text: str) -> bool:
 
 
 def should_translate_query(query: str, mode: TranslateMode) -> bool:
-    if mode == "off":
+    if mode in {"off", "query_and_hits"}:
         return False
-    # practical default for MVP:
-    # translate RU/mixed queries to English if translation mode is enabled.
+    # query / dual_query:
+    # translate RU or mixed query to English when translation is enabled.
     return contains_cyrillic(query)
 
 
@@ -282,6 +282,64 @@ def build_retrieval_stmt(
 
     return stmt
 
+def fetch_hits_for_embedding(
+    *,
+    query_embedding: list[float],
+    top_k: int,
+    document_id: int | None = None,
+    source_id: str | None = None,
+    region: str | None = None,
+) -> list[RetrievalHit]:
+    with session_scope() as session:
+        rows = session.execute(
+            build_retrieval_stmt(
+                query_embedding,
+                top_k=top_k,
+                document_id=document_id,
+                source_id=source_id,
+                region=region,
+            )
+        ).all()
+
+    hits: list[RetrievalHit] = []
+    for chunk, document, distance in rows:
+        dist = float(distance)
+        hits.append(
+            RetrievalHit(
+                chunk_id=chunk.id,
+                document_id=chunk.document_id,
+                chunk_index=chunk.chunk_index,
+                source_id=document.source_id,
+                source_name=document.source_name,
+                title=document.title,
+                region=document.region,
+                year=document.year,
+                url=document.url,
+                file_path=document.file_path,
+                section_title=chunk.section_title,
+                chunk_text=chunk.chunk_text,
+                char_count=chunk.char_count,
+                distance=dist,
+                score=score_from_distance(dist),
+            )
+        )
+    return hits
+
+def merge_and_rerank_hits(
+    *hits_lists: Iterable[RetrievalHit],
+    top_k: int,
+) -> list[RetrievalHit]:
+    best_by_chunk_id: dict[int, RetrievalHit] = {}
+
+    for hits in hits_lists:
+        for hit in hits:
+            existing = best_by_chunk_id.get(hit.chunk_id)
+            if existing is None or hit.distance < existing.distance:
+                best_by_chunk_id[hit.chunk_id] = hit
+
+    merged = list(best_by_chunk_id.values())
+    merged.sort(key=lambda x: (x.distance, x.document_id, x.chunk_index))
+    return merged[:clamp_top_k(top_k)]
 
 def score_from_distance(distance: float) -> float:
     # cosine distance in pgvector: lower is better; similarity-like score for UI.
@@ -366,57 +424,84 @@ def retrieve(
             debug=debug,
         )
 
-    if should_translate_query(raw_query, translate_mode) and translator is not None:
-        query_translation = translator.translate(
+    use_dual_query = translate_mode == "dual_query" and contains_cyrillic(raw_query)
+
+    ru_hits: list[RetrievalHit] = []
+    translated_hits: list[RetrievalHit] = []
+
+    if use_dual_query:
+        raw_query_embedding = get_query_embedding(
             raw_query,
-            target_language_code=translate_query_target_lang,
-            source_language_code=translate_source_lang,
+            api_url=embeddings_api_url,
+            doc_model_uri=doc_model_uri,
+            query_model_uri=query_model_uri,
+            folder_id=folder_id,
+            api_key=api_key,
+            iam_token=iam_token,
+            debug=debug,
         )
-        effective_query = query_translation.translated_text
+        ru_hits = fetch_hits_for_embedding(
+            query_embedding=raw_query_embedding,
+            top_k=max(top_k, 8),
+            document_id=document_id,
+            source_id=source_id,
+            region=region,
+        )
 
-    query_embedding = get_query_embedding(
-        effective_query,
-        api_url=embeddings_api_url,
-        doc_model_uri=doc_model_uri,
-        query_model_uri=query_model_uri,
-        folder_id=folder_id,
-        api_key=api_key,
-        iam_token=iam_token,
-        debug=debug,
-    )
+        if translator is not None:
+            query_translation = translator.translate(
+                raw_query,
+                target_language_code=translate_query_target_lang,
+                source_language_code=translate_source_lang,
+            )
+            effective_query = query_translation.translated_text
 
-    with session_scope() as session:
-        rows = session.execute(
-            build_retrieval_stmt(
-                query_embedding,
-                top_k=top_k,
+            translated_query_embedding = get_query_embedding(
+                effective_query,
+                api_url=embeddings_api_url,
+                doc_model_uri=doc_model_uri,
+                query_model_uri=query_model_uri,
+                folder_id=folder_id,
+                api_key=api_key,
+                iam_token=iam_token,
+                debug=debug,
+            )
+            translated_hits = fetch_hits_for_embedding(
+                query_embedding=translated_query_embedding,
+                top_k=max(top_k, 8),
                 document_id=document_id,
                 source_id=source_id,
                 region=region,
             )
-        ).all()
 
-    hits: list[RetrievalHit] = []
-    for chunk, document, distance in rows:
-        dist = float(distance)
-        hits.append(
-            RetrievalHit(
-                chunk_id=chunk.id,
-                document_id=chunk.document_id,
-                chunk_index=chunk.chunk_index,
-                source_id=document.source_id,
-                source_name=document.source_name,
-                title=document.title,
-                region=document.region,
-                year=document.year,
-                url=document.url,
-                file_path=document.file_path,
-                section_title=chunk.section_title,
-                chunk_text=chunk.chunk_text,
-                char_count=chunk.char_count,
-                distance=dist,
-                score=score_from_distance(dist),
+        hits = merge_and_rerank_hits(ru_hits, translated_hits, top_k=top_k)
+
+    else:
+        if should_translate_query(raw_query, translate_mode) and translator is not None:
+            query_translation = translator.translate(
+                raw_query,
+                target_language_code=translate_query_target_lang,
+                source_language_code=translate_source_lang,
             )
+            effective_query = query_translation.translated_text
+
+        query_embedding = get_query_embedding(
+            effective_query,
+            api_url=embeddings_api_url,
+            doc_model_uri=doc_model_uri,
+            query_model_uri=query_model_uri,
+            folder_id=folder_id,
+            api_key=api_key,
+            iam_token=iam_token,
+            debug=debug,
+        )
+
+        hits = fetch_hits_for_embedding(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            document_id=document_id,
+            source_id=source_id,
+            region=region,
         )
 
     hits = translate_hits_if_needed(
@@ -480,9 +565,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--region", help="Search only in one region.")
     parser.add_argument(
         "--translate-mode",
-        choices=["off", "query", "query_and_hits"],
+        choices=["off", "query", "query_and_hits", "dual_query"],
         default=TRANSLATE_MODE,
-        help="Translation strategy: off | query | query_and_hits",
+        help="Translation strategy: off | query | query_and_hits | dual_query",
     )
     parser.add_argument(
         "--translate-query-target-lang",
