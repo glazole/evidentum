@@ -80,6 +80,7 @@ class RetrievalHit:
     char_count: int
     score: float
     distance: float
+    retrieval_source: str | None = None   # raw_query | translated_query
     translated_chunk_text: str | None = None
     translation_detected_language: str | None = None
 
@@ -286,6 +287,7 @@ def fetch_hits_for_embedding(
     *,
     query_embedding: list[float],
     top_k: int,
+    retrieval_source: str,
     document_id: int | None = None,
     source_id: str | None = None,
     region: str | None = None,
@@ -321,6 +323,7 @@ def fetch_hits_for_embedding(
                 char_count=chunk.char_count,
                 distance=dist,
                 score=score_from_distance(dist),
+                retrieval_source=retrieval_source,
             )
         )
     return hits
@@ -443,6 +446,7 @@ def retrieve(
         ru_hits = fetch_hits_for_embedding(
             query_embedding=raw_query_embedding,
             top_k=max(top_k, 8),
+            retrieval_source="ru_pass",
             document_id=document_id,
             source_id=source_id,
             region=region,
@@ -469,6 +473,7 @@ def retrieve(
             translated_hits = fetch_hits_for_embedding(
                 query_embedding=translated_query_embedding,
                 top_k=max(top_k, 8),
+                retrieval_source="en_pass",
                 document_id=document_id,
                 source_id=source_id,
                 region=region,
@@ -499,6 +504,7 @@ def retrieve(
         hits = fetch_hits_for_embedding(
             query_embedding=query_embedding,
             top_k=top_k,
+            retrieval_source="translated_query" if query_translation is not None else "raw_query",
             document_id=document_id,
             source_id=source_id,
             region=region,
@@ -543,7 +549,7 @@ def format_hits_for_console(result: RetrievalResult) -> str:
         lines.extend(
             [
                 "",
-                f"[{idx}] score={hit.score:.6f} distance={hit.distance:.6f}",
+                f"[{idx}] score={hit.score:.6f} distance={hit.distance:.6f} retrieval_source={hit.retrieval_source}",
                 f"source_id={hit.source_id} document_id={hit.document_id} chunk_id={hit.chunk_id}",
                 f"title={hit.title}",
                 f"section={hit.section_title}",
