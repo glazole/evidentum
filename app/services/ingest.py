@@ -323,7 +323,6 @@ def chunk_text(
     overlap_chars: int = 200,
     min_chars: int = 150,
     min_words: int = 5,
-    prefer_kr_headings: bool = False,
 ) -> list[dict]:
     paragraphs = split_into_paragraphs(text)
     if not paragraphs:
@@ -333,6 +332,14 @@ def chunk_text(
     current_section: Optional[str] = None
     current_parts: list[str] = []
     current_len = 0
+
+    heading_re = re.compile(r"^\d+(?:\.\d+)*[.)]?\s+\S+")
+
+    def normalize_line(line: str) -> str:
+        line = normalize_whitespace(line)
+        line = line.replace("\n", " ")
+        line = re.sub(r"\s+", " ", line).strip()
+        return line
 
     def is_valid_chunk(chunk_body: str) -> bool:
         chunk_body = chunk_body.strip()
@@ -348,7 +355,6 @@ def chunk_text(
         chunk_body = chunk_body.strip()
         if not is_valid_chunk(chunk_body):
             return
-
         chunks.append(
             {
                 "section_title": current_section,
@@ -365,27 +371,47 @@ def chunk_text(
         current_len = 0
 
     for paragraph in paragraphs:
-        normalized_paragraph = normalize_heading_text(paragraph)
+        lines = [normalize_line(x) for x in paragraph.splitlines() if normalize_line(x)]
 
-        heading_detected = (
-            is_kr_heading(normalized_paragraph)
-            if prefer_kr_headings
-            else is_heading(normalized_paragraph)
-        )
+        buffer_parts: list[str] = []
+        for line in lines:
+            if heading_re.match(line):
+                if buffer_parts:
+                    text_part = "\n".join(buffer_parts).strip()
+                    if text_part:
+                        projected = current_len + len(text_part) + (2 if current_parts else 0)
+                        if projected <= target_chars:
+                            current_parts.append(text_part)
+                            current_len = projected
+                        else:
+                            flush()
+                            current_parts = [text_part]
+                            current_len = len(text_part)
+                    buffer_parts = []
 
-        if heading_detected:
-            current_section = normalized_paragraph[:512]
-            if current_parts:
-                flush()
+                if current_parts:
+                    flush()
+
+                current_section = line[:512]
+                continue
+
+            buffer_parts.append(line)
+
+        if buffer_parts:
+            paragraph_text = "\n".join(buffer_parts).strip()
+        else:
+            paragraph_text = ""
+
+        if not paragraph_text:
             continue
 
-        paragraph_len = len(paragraph)
+        paragraph_len = len(paragraph_text)
 
         if paragraph_len > target_chars:
             start = 0
             while start < paragraph_len:
                 end = min(start + target_chars, paragraph_len)
-                part = paragraph[start:end].strip()
+                part = paragraph_text[start:end].strip()
                 if part:
                     if current_parts:
                         flush()
@@ -398,21 +424,12 @@ def chunk_text(
         projected = current_len + paragraph_len + (2 if current_parts else 0)
 
         if projected <= target_chars:
-            current_parts.append(paragraph)
+            current_parts.append(paragraph_text)
             current_len = projected
         else:
             flush()
-            if overlap_chars > 0 and chunks:
-                tail = chunks[-1]["chunk_text"][-overlap_chars:].strip()
-                if tail:
-                    current_parts = [tail, paragraph]
-                    current_len = len(tail) + len(paragraph) + 2
-                else:
-                    current_parts = [paragraph]
-                    current_len = paragraph_len
-            else:
-                current_parts = [paragraph]
-                current_len = paragraph_len
+            current_parts = [paragraph_text]
+            current_len = paragraph_len
 
     if current_parts:
         flush()
@@ -435,11 +452,9 @@ def upsert_document(
             return existing, len(existing.chunks), False
 
         text_for_chunks = parsed.text
-        prefer_kr_headings = False
 
         if is_ru_clinical_recommendation(parsed):
             text_for_chunks = extract_kr_sections_1_to_7(parsed.text)
-            prefer_kr_headings = True
 
         if existing:
             existing.source_name = parsed.source_name
@@ -477,7 +492,6 @@ def upsert_document(
             text_for_chunks,
             target_chars=target_chars,
             overlap_chars=overlap_chars,
-            prefer_kr_headings=prefer_kr_headings,
         )
 
         for idx, chunk in enumerate(chunks):
