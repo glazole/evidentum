@@ -339,6 +339,81 @@ def split_into_paragraphs(text: str) -> list[str]:
     return paragraphs
 
 
+def split_section_text(
+    text: str,
+    *,
+    target_chars: int = 1200,
+    overlap_chars: int = 200,
+    min_chars: int = 150,
+    min_words: int = 5,
+) -> list[str]:
+    text = normalize_whitespace(text)
+    if not text:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    text_len = len(text)
+
+    while start < text_len:
+        end = min(start + target_chars, text_len)
+
+        if end < text_len:
+            cut = text.rfind(" ", start, end)
+            if cut > start + target_chars // 2:
+                end = cut
+
+        part = text[start:end].strip()
+        if part and len(part) >= min_chars and len(part.split()) >= min_words:
+            chunks.append(part)
+
+        if end >= text_len:
+            break
+
+        start = max(end - overlap_chars, start + 1)
+
+    return chunks
+
+
+def build_sections(text: str) -> list[dict]:
+    lines = [normalize_heading_text(line) for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    top_heading_re = re.compile(r"^(?P<num>[1-9])(?:[.)])?\s+(?P<title>\S.*)$")
+
+    sections: list[dict] = []
+    current_title: Optional[str] = None
+    current_lines: list[str] = []
+
+    def flush_section() -> None:
+        nonlocal current_title, current_lines
+        if current_title and current_lines:
+            body = "\n".join(current_lines).strip()
+            if body:
+                sections.append(
+                    {
+                        "section_title": current_title,
+                        "section_text": body,
+                    }
+                )
+        current_lines = []
+
+    for line in lines:
+        match = top_heading_re.match(line)
+
+        if match:
+            flush_section()
+            current_title = line[:512]
+            continue
+
+        if current_title is not None:
+            current_lines.append(line)
+
+    flush_section()
+    return sections
+
+
 def chunk_text(
     text: str,
     *,
@@ -347,121 +422,32 @@ def chunk_text(
     min_chars: int = 150,
     min_words: int = 5,
 ) -> list[dict]:
-    paragraphs = split_into_paragraphs(text)
-    if not paragraphs:
+    sections = build_sections(text)
+    if not sections:
         return []
 
     chunks: list[dict] = []
-    current_section: Optional[str] = None
-    current_parts: list[str] = []
-    current_len = 0
 
-    top_heading_re = re.compile(r"^\d+[.)]?\s+\S+")
-    sub_heading_re = re.compile(r"^\d+\.\d+(?:\.\d+)*[.)]?\s+\S+")
+    for section in sections:
+        section_title = section["section_title"]
+        section_text = section["section_text"]
 
-    def normalize_line(line: str) -> str:
-        line = normalize_whitespace(line)
-        line = line.replace("\n", " ")
-        line = re.sub(r"\s+", " ", line).strip()
-        return line
-
-    def is_valid_chunk(chunk_body: str) -> bool:
-        chunk_body = chunk_body.strip()
-        if not chunk_body:
-            return False
-        if len(chunk_body) < min_chars:
-            return False
-        if len(chunk_body.split()) < min_words:
-            return False
-        return True
-
-    def append_chunk(chunk_body: str) -> None:
-        chunk_body = chunk_body.strip()
-        if not is_valid_chunk(chunk_body):
-            return
-        chunks.append(
-            {
-                "section_title": current_section,
-                "chunk_text": chunk_body,
-                "char_count": len(chunk_body),
-            }
+        section_chunks = split_section_text(
+            section_text,
+            target_chars=target_chars,
+            overlap_chars=overlap_chars,
+            min_chars=min_chars,
+            min_words=min_words,
         )
 
-    def flush() -> None:
-        nonlocal current_parts, current_len
-        chunk_body = "\n\n".join(current_parts).strip()
-        append_chunk(chunk_body)
-        current_parts = []
-        current_len = 0
-
-    for paragraph in paragraphs:
-        lines = [normalize_line(x) for x in paragraph.splitlines() if normalize_line(x)]
-
-        buffer_parts: list[str] = []
-        for line in lines:
-            if top_heading_re.match(line):
-                if buffer_parts:
-                    text_part = "\n".join(buffer_parts).strip()
-                    if text_part:
-                        projected = current_len + len(text_part) + (2 if current_parts else 0)
-                        if projected <= target_chars:
-                            current_parts.append(text_part)
-                            current_len = projected
-                        else:
-                            flush()
-                            current_parts = [text_part]
-                            current_len = len(text_part)
-                    buffer_parts = []
-
-                if current_parts:
-                    flush()
-
-                current_section = line[:512]
-                continue
-
-            if sub_heading_re.match(line):
-                # подраздел просто добавляем в текст чанка, а не режем им chunk
-                buffer_parts.append(line)
-                continue
-
-            buffer_parts.append(line)
-
-        if buffer_parts:
-            paragraph_text = "\n".join(buffer_parts).strip()
-        else:
-            paragraph_text = ""
-
-        if not paragraph_text:
-            continue
-
-        paragraph_len = len(paragraph_text)
-
-        if paragraph_len > target_chars:
-            start = 0
-            while start < paragraph_len:
-                end = min(start + target_chars, paragraph_len)
-                part = paragraph_text[start:end].strip()
-                if part:
-                    if current_parts:
-                        flush()
-                    append_chunk(part)
-                if end >= paragraph_len:
-                    break
-                start = max(end - overlap_chars, start + 1)
-            continue
-
-        projected = current_len + paragraph_len + (2 if current_parts else 0)
-
-        if projected <= target_chars:
-            current_parts.append(paragraph_text)
-            current_len = projected
-        else:
-            flush()
-            current_parts = [paragraph_text]
-            current_len = paragraph_len
-
-    if current_parts:
-        flush()
+        for chunk_body in section_chunks:
+            chunks.append(
+                {
+                    "section_title": section_title,
+                    "chunk_text": chunk_body,
+                    "char_count": len(chunk_body),
+                }
+            )
 
     return chunks
 
