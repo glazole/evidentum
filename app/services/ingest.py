@@ -44,6 +44,67 @@ KR_TOP_LEVEL_HEADING_RE = re.compile(
     r"^(?P<num>[1-9])(?:[.)])?\s+(?P<title>\S.*)$"
 )
 
+KR_CANONICAL_SECTION_TITLES = [
+    "1. Краткая информация по заболеванию или состоянию (группе заболеваний или состояний)",
+    "2. Диагностика заболевания или состояния (группы заболеваний или состояний), медицинские показания и противопоказания к применению методов диагностики",
+    "3. Лечение, включая медикаментозную и немедикаментозную терапии, диетотерапию, обезболивание, медицинские показания и противопоказания к применению методов лечения",
+    "4. Медицинская реабилитация и санаторно-курортное лечение, медицинские показания и противопоказания к применению методов медицинской реабилитации, в том числе основанных на использовании природных лечебных факторов",
+    "5. Профилактика и диспансерное наблюдение, медицинские показания и противопоказания к применению методов профилактики",
+    "6. Организация оказания медицинской помощи",
+    "7. Дополнительная информация (в том числе факторы, влияющие на исход заболевания или состояния)",
+]
+
+def normalize_kr_title_for_match(text: str) -> str:
+    text = normalize_whitespace(text)
+    text = text.replace("ё", "е").replace("Ё", "Е")
+    text = text.replace("̆", "")
+    text = text.replace("–", "-").replace("—", "-")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+KR_CANONICAL_SECTION_MAP = {
+    normalize_kr_title_for_match(title): title
+    for title in KR_CANONICAL_SECTION_TITLES
+}
+
+def split_kr_into_canonical_sections(text: str) -> list[dict]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    sections: list[dict] = []
+    current_title: Optional[str] = None
+    current_lines: list[str] = []
+
+    def flush_section() -> None:
+        nonlocal current_title, current_lines
+        if current_title is None:
+            current_lines = []
+            return
+
+        body = "\n".join(current_lines).strip()
+        if body:
+            sections.append(
+                {
+                    "section_title": current_title,
+                    "section_text": body,
+                }
+            )
+        current_lines = []
+
+    for raw_line in lines:
+        normalized_line = normalize_kr_title_for_match(raw_line)
+
+        if normalized_line in KR_CANONICAL_SECTION_MAP:
+            flush_section()
+            current_title = KR_CANONICAL_SECTION_MAP[normalized_line]
+            continue
+
+        if current_title is not None:
+            current_lines.append(normalize_whitespace(raw_line))
+
+    flush_section()
+    return sections
 
 def normalize_heading_text(text: str) -> str:
     text = normalize_whitespace(text)
@@ -520,7 +581,7 @@ def chunk_text(
     min_chars: int = 150,
     min_words: int = 5,
 ) -> list[dict]:
-    sections = split_kr_into_sections(text)
+    sections = split_kr_into_canonical_sections(text)
     if not sections:
         return []
 
