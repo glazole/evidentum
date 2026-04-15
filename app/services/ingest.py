@@ -72,20 +72,43 @@ def is_kr_heading(paragraph: str) -> bool:
 
 def extract_kr_sections_1_to_7(text: str) -> str:
     """
-    Keeps only top-level sections 1..7 from Russian clinical recommendations.
-    Works line-by-line, which is more robust for extracted PDF text.
+    Keeps only real top-level sections 1..7 from Russian clinical recommendations.
+    Skips the table of contents and starts from the main body.
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return text
 
+    normalized_lines = [normalize_heading_text(line) for line in lines]
+
+    # Find where the real body starts:
+    # after "Термины и определения" and then the next top-level section 1.
+    terms_idx = None
+    for i, line in enumerate(normalized_lines):
+        if line.upper().startswith("ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ"):
+            terms_idx = i
+            break
+
+    start_idx = None
+    search_from = (terms_idx + 1) if terms_idx is not None else 0
+
+    for i in range(search_from, len(normalized_lines)):
+        line = normalized_lines[i]
+        top_match = KR_TOP_LEVEL_HEADING_RE.match(line)
+        if top_match and int(top_match.group("num")) == 1:
+            start_idx = i
+            break
+
+    if start_idx is None:
+        return text
+
     kept: list[str] = []
     in_target_block = False
 
-    for line in lines:
-        normalized = normalize_heading_text(line)
+    for i in range(start_idx, len(normalized_lines)):
+        line = normalized_lines[i]
 
-        top_match = KR_TOP_LEVEL_HEADING_RE.match(normalized)
+        top_match = KR_TOP_LEVEL_HEADING_RE.match(line)
         if top_match:
             top_num = int(top_match.group("num"))
 
@@ -93,17 +116,17 @@ def extract_kr_sections_1_to_7(text: str) -> str:
                 in_target_block = True
 
             if in_target_block and 1 <= top_num <= 7:
-                kept.append(normalized)
+                kept.append(line)
                 continue
 
             if in_target_block and top_num >= 8:
                 break
 
         if in_target_block:
-            upper_line = normalized.upper()
+            upper_line = line.upper()
             if upper_line.startswith("СПИСОК ЛИТЕРАТУРЫ") or upper_line.startswith("ПРИЛОЖЕНИЕ"):
                 break
-            kept.append(normalized)
+            kept.append(line)
 
     if not kept:
         return text
