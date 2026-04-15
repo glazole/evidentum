@@ -85,7 +85,7 @@ def extract_kr_sections_1_to_7(text: str) -> str:
     # after "Термины и определения" and then the next top-level section 1.
     terms_idx = None
     for i, line in enumerate(normalized_lines):
-        if line.upper().startswith("ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ"):
+        if line.startswith("Термины и определения"):
             terms_idx = i
             break
 
