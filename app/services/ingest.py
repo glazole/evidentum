@@ -73,19 +73,19 @@ def is_kr_heading(paragraph: str) -> bool:
 def extract_kr_sections_1_to_7(text: str) -> str:
     """
     Keeps only top-level sections 1..7 from Russian clinical recommendations.
-    Stops before section 8 / literature / appendices if present.
+    Works line-by-line, which is more robust for extracted PDF text.
     """
-    paragraphs = split_into_paragraphs(text)
-    if not paragraphs:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
         return text
 
     kept: list[str] = []
     in_target_block = False
 
-    for paragraph in paragraphs:
-        p = normalize_heading_text(paragraph)
+    for line in lines:
+        normalized = normalize_heading_text(line)
 
-        top_match = KR_TOP_LEVEL_HEADING_RE.match(p)
+        top_match = KR_TOP_LEVEL_HEADING_RE.match(normalized)
         if top_match:
             top_num = int(top_match.group("num"))
 
@@ -93,22 +93,22 @@ def extract_kr_sections_1_to_7(text: str) -> str:
                 in_target_block = True
 
             if in_target_block and 1 <= top_num <= 7:
-                kept.append(paragraph)
+                kept.append(normalized)
                 continue
 
             if in_target_block and top_num >= 8:
                 break
 
         if in_target_block:
-            upper_p = p.upper()
-            if upper_p.startswith("СПИСОК ЛИТЕРАТУРЫ") or upper_p.startswith("ПРИЛОЖЕНИЕ"):
+            upper_line = normalized.upper()
+            if upper_line.startswith("СПИСОК ЛИТЕРАТУРЫ") or upper_line.startswith("ПРИЛОЖЕНИЕ"):
                 break
-            kept.append(paragraph)
+            kept.append(normalized)
 
     if not kept:
         return text
 
-    return normalize_whitespace("\n\n".join(kept))
+    return "\n".join(kept)
 
 
 def sha256_text(value: str) -> str:
