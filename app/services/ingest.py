@@ -356,7 +356,8 @@ def chunk_text(
     current_parts: list[str] = []
     current_len = 0
 
-    heading_re = re.compile(r"^\d+(?:\.\d+)*[.)]?\s+\S+")
+    top_heading_re = re.compile(r"^\d+[.)]?\s+\S+")
+    sub_heading_re = re.compile(r"^\d+\.\d+(?:\.\d+)*[.)]?\s+\S+")
 
     def normalize_line(line: str) -> str:
         line = normalize_whitespace(line)
@@ -398,7 +399,7 @@ def chunk_text(
 
         buffer_parts: list[str] = []
         for line in lines:
-            if heading_re.match(line):
+            if top_heading_re.match(line):
                 if buffer_parts:
                     text_part = "\n".join(buffer_parts).strip()
                     if text_part:
@@ -416,6 +417,11 @@ def chunk_text(
                     flush()
 
                 current_section = line[:512]
+                continue
+
+            if sub_heading_re.match(line):
+                # подраздел просто добавляем в текст чанка, а не режем им chunk
+                buffer_parts.append(line)
                 continue
 
             buffer_parts.append(line)
