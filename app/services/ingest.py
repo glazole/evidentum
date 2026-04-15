@@ -36,6 +36,80 @@ class ParsedDocument:
     file_path: Optional[str] = None
     metadata_json: Optional[dict] = None
 
+KR_SECTION_HEADING_RE = re.compile(
+    r"^(?P<num>[1-9](?:\.\d+)*)(?:[.)])?\s+(?P<title>\S.*)$"
+)
+
+KR_TOP_LEVEL_HEADING_RE = re.compile(
+    r"^(?P<num>[1-9])(?:[.)])?\s+(?P<title>\S.*)$"
+)
+
+
+def normalize_heading_text(text: str) -> str:
+    text = normalize_whitespace(text)
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:512]
+
+
+def is_ru_clinical_recommendation(parsed: ParsedDocument) -> bool:
+    source = f"{parsed.source_id} {parsed.source_name} {parsed.title}".lower()
+    body = parsed.text[:5000].lower()
+    return (
+        "кр" in source
+        or "clinical_rekom" in source
+        or "клиническ" in body
+        or "оглавление" in body
+    )
+
+
+def is_kr_heading(paragraph: str) -> bool:
+    paragraph = normalize_heading_text(paragraph)
+    if not paragraph or len(paragraph) > 500:
+        return False
+    return KR_SECTION_HEADING_RE.match(paragraph) is not None
+
+
+def extract_kr_sections_1_to_7(text: str) -> str:
+    """
+    Keeps only top-level sections 1..7 from Russian clinical recommendations.
+    Stops before section 8 / literature / appendices if present.
+    """
+    paragraphs = split_into_paragraphs(text)
+    if not paragraphs:
+        return text
+
+    kept: list[str] = []
+    in_target_block = False
+
+    for paragraph in paragraphs:
+        p = normalize_heading_text(paragraph)
+
+        top_match = KR_TOP_LEVEL_HEADING_RE.match(p)
+        if top_match:
+            top_num = int(top_match.group("num"))
+
+            if top_num == 1:
+                in_target_block = True
+
+            if in_target_block and 1 <= top_num <= 7:
+                kept.append(paragraph)
+                continue
+
+            if in_target_block and top_num >= 8:
+                break
+
+        if in_target_block:
+            upper_p = p.upper()
+            if upper_p.startswith("СПИСОК ЛИТЕРАТУРЫ") or upper_p.startswith("ПРИЛОЖЕНИЕ"):
+                break
+            kept.append(paragraph)
+
+    if not kept:
+        return text
+
+    return normalize_whitespace("\n\n".join(kept))
+
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -249,6 +323,7 @@ def chunk_text(
     overlap_chars: int = 200,
     min_chars: int = 150,
     min_words: int = 5,
+    prefer_kr_headings: bool = False,
 ) -> list[dict]:
     paragraphs = split_into_paragraphs(text)
     if not paragraphs:
@@ -290,8 +365,16 @@ def chunk_text(
         current_len = 0
 
     for paragraph in paragraphs:
-        if is_heading(paragraph):
-            current_section = paragraph[:512]
+        normalized_paragraph = normalize_heading_text(paragraph)
+
+        heading_detected = (
+            is_kr_heading(normalized_paragraph)
+            if prefer_kr_headings
+            else is_heading(normalized_paragraph)
+        )
+
+        if heading_detected:
+            current_section = normalized_paragraph[:512]
             if current_parts:
                 flush()
             continue
@@ -299,7 +382,6 @@ def chunk_text(
         paragraph_len = len(paragraph)
 
         if paragraph_len > target_chars:
-            # hard split large paragraph
             start = 0
             while start < paragraph_len:
                 end = min(start + target_chars, paragraph_len)
@@ -337,7 +419,6 @@ def chunk_text(
 
     return chunks
 
-
 def upsert_document(
     parsed: ParsedDocument,
     *,
@@ -352,6 +433,13 @@ def upsert_document(
 
         if existing and existing.checksum == parsed.checksum and not force_reingest:
             return existing, len(existing.chunks), False
+
+        text_for_chunks = parsed.text
+        prefer_kr_headings = False
+
+        if is_ru_clinical_recommendation(parsed):
+            text_for_chunks = extract_kr_sections_1_to_7(parsed.text)
+            prefer_kr_headings = True
 
         if existing:
             existing.source_name = parsed.source_name
@@ -386,9 +474,10 @@ def upsert_document(
             session.flush()
 
         chunks = chunk_text(
-            parsed.text,
+            text_for_chunks,
             target_chars=target_chars,
             overlap_chars=overlap_chars,
+            prefer_kr_headings=prefer_kr_headings,
         )
 
         for idx, chunk in enumerate(chunks):
@@ -413,7 +502,6 @@ def upsert_document(
 
         session.flush()
         return document, len(chunks), True
-
 
 def ingest_file(
     file_path: str,
