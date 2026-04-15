@@ -54,6 +54,14 @@ KR_CANONICAL_SECTION_TITLES = [
     "7. Дополнительная информация (в том числе факторы, влияющие на исход заболевания или состояния)",
 ]
 
+def normalize_whitespace(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = text.replace("\u200b", "")
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def normalize_kr_title_for_match(text: str) -> str:
     text = normalize_whitespace(text)
     text = text.replace("ё", "е").replace("Ё", "Е")
@@ -201,15 +209,6 @@ def sha256_text(value: str) -> str:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-def normalize_whitespace(text: str) -> str:
-    text = text.replace("\xa0", " ")
-    text = text.replace("\u200b", "")
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
 
 
 def slugify(value: str) -> str:
