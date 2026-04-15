@@ -414,6 +414,104 @@ def build_sections(text: str) -> list[dict]:
     return sections
 
 
+def is_real_kr_top_heading(line: str, expected_num: int) -> bool:
+    line = normalize_heading_text(line)
+    match = KR_TOP_LEVEL_HEADING_RE.match(line)
+    if not match:
+        return False
+
+    num = int(match.group("num"))
+    if num != expected_num:
+        return False
+
+    title = match.group("title").strip()
+    if not title:
+        return False
+
+    # Для реальных верхних разделов заголовок обычно начинается с заглавной буквы,
+    # а не с "эдоксабан", "апиксабан" и т.п.
+    first_char = title[0]
+    if not first_char.isalpha() or not first_char.isupper():
+        return False
+
+    # Слишком короткие строки типа "4) да" не считаем заголовками секций
+    if len(title) < 15:
+        return False
+
+    return True
+
+
+def split_kr_into_sections(text: str) -> list[dict]:
+    lines = [normalize_heading_text(line) for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    sections: list[dict] = []
+    current_title: Optional[str] = None
+    current_lines: list[str] = []
+    expected_num = 1
+
+    def flush_section() -> None:
+        nonlocal current_title, current_lines
+        if current_title:
+            body = "\n".join(current_lines).strip()
+            if body:
+                sections.append(
+                    {
+                        "section_title": current_title,
+                        "section_text": body,
+                    }
+                )
+        current_lines = []
+
+    for line in lines:
+        if expected_num <= 7 and is_real_kr_top_heading(line, expected_num):
+            flush_section()
+            current_title = line[:512]
+            expected_num += 1
+            continue
+
+        if current_title is not None:
+            current_lines.append(line)
+
+    flush_section()
+    return sections
+
+def split_text_by_size(
+    text: str,
+    *,
+    target_chars: int = 1200,
+    overlap_chars: int = 200,
+    min_chars: int = 150,
+    min_words: int = 5,
+) -> list[str]:
+    text = normalize_whitespace(text)
+    if not text:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    text_len = len(text)
+
+    while start < text_len:
+        end = min(start + target_chars, text_len)
+
+        if end < text_len:
+            cut = text.rfind(" ", start, end)
+            if cut > start + target_chars // 2:
+                end = cut
+
+        part = text[start:end].strip()
+        if part and len(part) >= min_chars and len(part.split()) >= min_words:
+            chunks.append(part)
+
+        if end >= text_len:
+            break
+
+        start = max(end - overlap_chars, start + 1)
+
+    return chunks
+
 def chunk_text(
     text: str,
     *,
@@ -422,7 +520,7 @@ def chunk_text(
     min_chars: int = 150,
     min_words: int = 5,
 ) -> list[dict]:
-    sections = build_sections(text)
+    sections = split_kr_into_sections(text)
     if not sections:
         return []
 
@@ -432,7 +530,7 @@ def chunk_text(
         section_title = section["section_title"]
         section_text = section["section_text"]
 
-        section_chunks = split_section_text(
+        section_chunks = split_text_by_size(
             section_text,
             target_chars=target_chars,
             overlap_chars=overlap_chars,
