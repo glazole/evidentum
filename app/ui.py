@@ -173,39 +173,46 @@ def compare_guidelines(
     recommendation = data.get("recommendation")
     sources = data.get("sources") or []
 
-    md_parts: list[str] = []
+    # ── Per-source positions ────────────────────────────────────────────────
+    sources_md_parts: list[str] = []
+    for s in sources:
+        name = s.get("source_name") or s.get("source_id") or "-"
+        year = s.get("year") or "-"
+        region = s.get("region") or "-"
+        url = s.get("url")
+        text = (s.get("combined_text") or "").strip()
+        if len(text) > 800:
+            text = text[:800].rstrip() + " ..."
+        header = f"### {name} ({region}, {year})"
+        if url:
+            header += f" — [источник]({url})"
+        sources_md_parts.append(f"{header}\n\n{text}" if text else header)
+
+    sources_md = "\n\n---\n\n".join(sources_md_parts) if sources_md_parts else "Фрагменты не найдены."
+
+    # ── Synthesis ───────────────────────────────────────────────────────────
+    analysis_parts: list[str] = []
 
     if consensus:
-        md_parts += [f"## ✅ Консенсус\n{consensus}", ""]
+        analysis_parts += [f"## ✅ Консенсус\n{consensus}", ""]
 
     if disagreements:
-        md_parts.append("## ⚡ Расхождения")
+        analysis_parts.append("## ⚡ Расхождения между гайдлайнами")
         for item in disagreements:
             srcs = ", ".join(str(s) for s in (item.get("sources") or []))
             text = item.get("text") or ""
-            md_parts.append(f"**{srcs}:** {text}" if srcs else text)
-        md_parts.append("")
+            analysis_parts.append(f"**{srcs}:** {text}" if srcs else text)
+        analysis_parts.append("")
+    elif consensus:
+        analysis_parts += ["## ⚡ Расхождения\n_Существенных расхождений не выявлено._", ""]
 
     if recommendation:
-        md_parts += [f"## 💡 Итоговая рекомендация\n{recommendation}", ""]
+        analysis_parts += [f"## 💡 Итоговая рекомендация\n{recommendation}", ""]
 
-    md_parts.append("_Не является медицинской рекомендацией._")
-    analysis_md = "\n".join(md_parts)
+    analysis_parts.append("_Не является медицинской рекомендацией._")
+    analysis_md = "\n".join(analysis_parts)
 
-    sources_lines = []
-    for s in sources:
-        name = s.get("source_name") or s.get("source_id") or "-"
-        year = s.get("year")
-        region = s.get("region") or "-"
-        url = s.get("url")
-        count = s.get("chunk_count", 0)
-        line = f"**{name}** ({year or '-'}) | region: {region} | {count} фрагм."
-        if url:
-            line += f" | [ссылка]({url})"
-        sources_lines.append(line)
-    sources_md = "\n".join(sources_lines)
-
-    return analysis_md, sources_md
+    return sources_md, analysis_md
 
 
 def load_document_summary(document_id: int | None) -> tuple[str, str]:
@@ -323,13 +330,13 @@ with gr.Blocks(title="Evidentum") as demo:
                     cmp_btn = gr.Button("Сравнить", variant="primary")
 
                 with gr.Column(scale=3):
-                    cmp_analysis = gr.Markdown(label="Анализ")
-                    cmp_sources = gr.Markdown(label="Найденные источники")
+                    cmp_sources = gr.Markdown(label="Позиции источников")
+                    cmp_analysis = gr.Markdown(label="Консенсус и расхождения")
 
             cmp_btn.click(
                 fn=compare_guidelines,
                 inputs=[cmp_question, cmp_top_k, cmp_translate_mode, cmp_model, cmp_temperature],
-                outputs=[cmp_analysis, cmp_sources],
+                outputs=[cmp_sources, cmp_analysis],
             )
 
         # ── Tab 3: Document Summary ───────────────────────────────────────────
