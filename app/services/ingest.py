@@ -36,6 +36,7 @@ class ParsedDocument:
     file_path: Optional[str] = None
     metadata_json: Optional[dict] = None
 
+
 KR_SECTION_HEADING_RE = re.compile(
     r"^(?P<num>[1-9](?:\.\d+)*)(?:[.)])?\s+(?P<title>\S.*)$"
 )
@@ -80,6 +81,59 @@ KNOWN_CANONICAL_URLS = {
     "esc_af_2024": "https://academic.oup.com/eurheartj/article/45/36/3314/7738779",
     "aha_af_2023": "https://www.ahajournals.org/doi/10.1161/CIR.0000000000001193",
 }
+
+def split_ru_top_level_sections(text: str) -> list[dict]:
+    lines = text.splitlines()
+    if not lines:
+        return []
+
+    sections: list[dict] = []
+    current_title: Optional[str] = None
+    current_content: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_title, current_content
+        if current_title:
+            content = "\n".join(current_content).strip()
+            if content:
+                sections.append(
+                    {
+                        "section_title": current_title,
+                        "section_text": content,
+                    }
+                )
+        current_title = None
+        current_content = []
+
+    for raw_line in lines:
+        line = normalize_whitespace(raw_line)
+        if not line:
+            if current_title is not None:
+                current_content.append("")
+            continue
+
+        normalized = normalize_kr_title_for_match(line)
+
+        # Канонический матч по полным названиям
+        if normalized in KR_CANONICAL_SECTION_MAP:
+            flush()
+            current_title = KR_CANONICAL_SECTION_MAP[normalized]
+            continue
+
+        # Только верхние уровни 1..7, без 1.1 / 2.3.4
+        m = KR_TOP_LEVEL_HEADING_RE.match(line)
+        if m:
+            num = m.group("num")
+            if num in {"1", "2", "3", "4", "5", "6", "7"}:
+                flush()
+                current_title = line[:512]
+                continue
+
+        if current_title is not None:
+            current_content.append(raw_line)
+
+    flush()
+    return sections
 
 
 def infer_document_identity(
@@ -516,7 +570,35 @@ def parse_url(
 
 
 def split_into_paragraphs(text: str) -> list[str]:
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    text = text.replace("\xa0", " ").replace("\u200b", "")
+    text = re.sub(r"\r\n?", "\n", text)
+
+    lines = [line.strip() for line in text.split("\n")]
+    paragraphs: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        nonlocal current
+        block = " ".join(part for part in current if part).strip()
+        if block:
+            block = re.sub(r"\s+", " ", block)
+            paragraphs.append(block)
+        current = []
+
+    for line in lines:
+        if not line:
+            flush()
+            continue
+
+        # если это явный заголовок/подзаголовок — выделяем отдельно
+        if re.match(r"^\d+(?:\.\d+)*[.)]?\s+\S+", line):
+            flush()
+            paragraphs.append(re.sub(r"\s+", " ", line))
+            continue
+
+        current.append(line)
+
+    flush()
     return paragraphs
 
 
@@ -525,33 +607,59 @@ def split_section_text(
     *,
     target_chars: int = 1200,
     overlap_chars: int = 200,
-    min_chars: int = 80,
+    min_chars: int = 150,
     min_words: int = 5,
 ) -> list[str]:
-    text = normalize_whitespace(text)
-    if not text:
+    paragraphs = split_into_paragraphs(text)
+    if not paragraphs:
         return []
 
     chunks: list[str] = []
-    start = 0
-    text_len = len(text)
+    current_parts: list[str] = []
+    current_len = 0
 
-    while start < text_len:
-        end = min(start + target_chars, text_len)
+    def flush() -> None:
+        nonlocal current_parts, current_len
+        chunk = "\n\n".join(current_parts).strip()
+        if chunk and len(chunk) >= min_chars and len(chunk.split()) >= min_words:
+            chunks.append(chunk)
+        current_parts = []
+        current_len = 0
 
-        if end < text_len:
-            cut = text.rfind(" ", start, end)
-            if cut > start + target_chars // 2:
-                end = cut
+    for para in paragraphs:
+        para_len = len(para)
 
-        part = text[start:end].strip()
-        if part and len(part) >= min_chars and len(part.split()) >= min_words:
-            chunks.append(part)
+        # если абзац очень большой — режем его отдельно
+        if para_len > target_chars:
+            if current_parts:
+                flush()
 
-        if end >= text_len:
-            break
+            start = 0
+            while start < para_len:
+                end = min(start + target_chars, para_len)
+                if end < para_len:
+                    cut = para.rfind(" ", start, end)
+                    if cut > start + target_chars // 2:
+                        end = cut
 
-        start = max(end - overlap_chars, start + 1)
+                part = para[start:end].strip()
+                if part and len(part) >= min_chars and len(part.split()) >= min_words:
+                    chunks.append(part)
+
+                if end >= para_len:
+                    break
+                start = max(end - overlap_chars, start + 1)
+            continue
+
+        add_len = para_len + (2 if current_parts else 0)
+        if current_len + add_len > target_chars and current_parts:
+            flush()
+
+        current_parts.append(para)
+        current_len += add_len
+
+    if current_parts:
+        flush()
 
     return chunks
 
@@ -591,25 +699,21 @@ def split_text_by_size(
     return chunks
 
 def detect_document_sections(parsed: ParsedDocument) -> list[dict]:
-    text = normalize_whitespace(parsed.text)
+    text = parsed.text
     if not text:
         return []
 
-    sections = split_into_sections_by_headers(text)
+    if (parsed.region or "").upper() == "RU":
+        sections = split_ru_top_level_sections(text)
+        if sections:
+            return sections
+        return [{"section_title": None, "section_text": text}]
 
-    # fallback: если секции не найдены, режем весь текст как один "безымянный" блок
+    sections = split_into_sections_by_headers(text)
     if not sections:
         return [{"section_title": None, "section_text": text}]
 
-    # для российских КР убираем мусорные секции и оставляем полезные верхние уровни
-    if (parsed.region or "").upper() == "RU":
-        sections = filter_sections(
-            sections,
-            keep_top_level_numbers=["1.", "2.", "3.", "4.", "5.", "6.", "7."],
-        )
-    else:
-        sections = filter_sections(sections)
-
+    sections = filter_sections(sections)
     if not sections:
         return [{"section_title": None, "section_text": text}]
 
