@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from typing import Any
 
@@ -32,18 +31,11 @@ def load_sources() -> list[dict[str, Any]]:
         return []
 
 
-def load_catalog() -> dict[str, list[str]]:
-    try:
-        return api_get("/catalog")
-    except Exception:
-        return {"specialties": [], "nosologies": [], "source_names": []}
-
-
 def build_source_choices() -> list[tuple[str, str]]:
     items = load_sources()
     choices: list[tuple[str, str]] = [("Все источники", "")]
     for item in items:
-        label = f"{item.get('source_id')} | {item.get('region') or '-'} | {item.get('title')}"
+        label = f"{item.get('source_name')} ({item.get('region') or '-'}, {item.get('year') or '-'})"
         choices.append((label, item.get("source_id", "")))
     return choices
 
@@ -55,16 +47,6 @@ def build_doc_choices() -> list[tuple[str, int]]:
         label = f"{item.get('source_name')} ({item.get('year') or '-'})"
         choices.append((label, item["document_id"]))
     return choices
-
-
-def build_specialty_choices() -> list[str]:
-    catalog = load_catalog()
-    return [""] + catalog.get("specialties", [])
-
-
-def build_nosology_choices() -> list[str]:
-    catalog = load_catalog()
-    return [""] + catalog.get("nosologies", [])
 
 
 def format_sources_table(sources: list[dict[str, Any]]) -> str:
@@ -80,21 +62,15 @@ def format_sources_table(sources: list[dict[str, Any]]) -> str:
         score = src.get("score")
         url = src.get("url") or "-"
         evidence = src.get("evidence_level")
-        nosology = src.get("nosology")
-        extra_parts = []
-        if nosology:
-            extra_parts.append(f"nosology: {nosology}")
-        if evidence:
-            extra_parts.append(f"evidence: {evidence}")
+        extra = f" [уровень доказательности: {evidence}]" if evidence else ""
         lines.append(
-            "\n".join(filter(None, [
-                f"[{idx}] {title}",
+            "\n".join([
+                f"[{idx}] {title}{extra}",
                 f"source_id: {source_id}",
                 f"section: {section}",
                 f"score: {score}",
                 f"url: {url}",
-                ", ".join(extra_parts) if extra_parts else None,
-            ]))
+            ])
         )
     return "\n\n---\n\n".join(lines)
 
@@ -115,7 +91,7 @@ def format_retrieval_preview(answer_payload: dict[str, Any]) -> str:
             snippet = snippet[:1200].rstrip() + " ..."
         lines = [f"[{idx}] {title}", f"section: {section}", ""]
         if summary:
-            lines += [f"_Резюме: {summary}_", ""]
+            lines += [f"Резюме: {summary}", ""]
         lines.append(snippet)
         blocks.append("\n".join(lines))
 
@@ -125,10 +101,7 @@ def format_retrieval_preview(answer_payload: dict[str, Any]) -> str:
 def ask_question(
     question: str,
     source_id: str,
-    specialty: str,
-    nosology: str,
     top_k: int,
-    per_source_k: int,
     translate_mode: str,
     model: str,
     temperature: float,
@@ -148,12 +121,6 @@ def ask_question(
     }
     if source_id:
         payload["source_id"] = source_id
-    if specialty:
-        payload["specialty"] = specialty
-    if nosology:
-        payload["nosology"] = nosology
-    if per_source_k > 0:
-        payload["per_source_k"] = int(per_source_k)
 
     try:
         answer_data = api_post("/answer", payload)
@@ -178,10 +145,7 @@ def ask_question(
 
 def compare_guidelines(
     question: str,
-    specialty: str,
-    nosology: str,
     top_k: int,
-    per_source_k: int,
     translate_mode: str,
     model: str,
     temperature: float,
@@ -193,15 +157,11 @@ def compare_guidelines(
     payload: dict[str, Any] = {
         "question": question,
         "top_k": int(top_k),
-        "per_source_k": int(per_source_k),
+        "per_source_k": 2,
         "translate_mode": translate_mode,
         "model": model,
         "temperature": float(temperature),
     }
-    if specialty:
-        payload["specialty"] = specialty
-    if nosology:
-        payload["nosology"] = nosology
 
     try:
         data = api_post("/compare", payload)
@@ -273,8 +233,6 @@ def generate_document_summary(document_id: int | None, model: str) -> tuple[str,
 # ── Build UI ──────────────────────────────────────────────────────────────────
 
 _source_choices = build_source_choices()
-_specialty_choices = build_specialty_choices()
-_nosology_choices = build_nosology_choices()
 _doc_choices = build_doc_choices()
 
 with gr.Blocks(title="Evidentum") as demo:
@@ -304,43 +262,26 @@ with gr.Blocks(title="Evidentum") as demo:
                     )
 
                     with gr.Row():
-                        specialty_dd = gr.Dropdown(
-                            choices=_specialty_choices,
-                            value="",
-                            label="Специальность",
-                        )
-                        nosology_dd = gr.Dropdown(
-                            choices=_nosology_choices,
-                            value="",
-                            label="Нозология",
-                        )
-
-                    with gr.Row():
-                        top_k = gr.Slider(minimum=3, maximum=15, value=6, step=1, label="Top-K")
-                        per_source_k = gr.Slider(
-                            minimum=0, maximum=5, value=0, step=1,
-                            label="Фрагм. на источник (0 = выкл.)",
-                        )
-
-                    with gr.Row():
-                        translate_mode = gr.Dropdown(
-                            choices=["off", "query", "query_and_hits", "dual_query"],
-                            value="dual_query",
-                            label="Режим перевода",
-                        )
                         model = gr.Dropdown(
                             choices=["alice", "yandex"],
                             value="alice",
                             label="Модель",
                         )
-
-                    with gr.Row():
                         temperature = gr.Slider(
                             minimum=0.0, maximum=1.0, value=0.2, step=0.1, label="Temperature"
                         )
-                        synthesize_cb = gr.Checkbox(
-                            value=True, label="Структурированный синтез (Консенсус/Расхождения)"
+
+                    with gr.Row():
+                        top_k = gr.Slider(minimum=3, maximum=15, value=6, step=1, label="Top-K")
+                        translate_mode = gr.Dropdown(
+                            choices=["off", "query", "query_and_hits", "dual_query"],
+                            value="dual_query",
+                            label="Режим перевода",
                         )
+
+                    synthesize_cb = gr.Checkbox(
+                        value=True, label="Структурированный синтез (Консенсус/Расхождения)"
+                    )
 
                     ask_btn = gr.Button("Спросить", variant="primary")
 
@@ -352,10 +293,7 @@ with gr.Blocks(title="Evidentum") as demo:
 
             ask_btn.click(
                 fn=ask_question,
-                inputs=[
-                    question, source_dropdown, specialty_dd, nosology_dd,
-                    top_k, per_source_k, translate_mode, model, temperature, synthesize_cb,
-                ],
+                inputs=[question, source_dropdown, top_k, translate_mode, model, temperature, synthesize_cb],
                 outputs=[answer_box, meta_box, sources_box, preview_box],
             )
 
@@ -369,29 +307,19 @@ with gr.Blocks(title="Evidentum") as demo:
                         placeholder="Например: антикоагулянтная терапия при ФП",
                     )
                     with gr.Row():
-                        cmp_specialty = gr.Dropdown(
-                            choices=_specialty_choices, value="", label="Специальность"
+                        cmp_model = gr.Dropdown(
+                            choices=["alice", "yandex"], value="alice", label="Модель"
                         )
-                        cmp_nosology = gr.Dropdown(
-                            choices=_nosology_choices, value="", label="Нозология"
+                        cmp_temperature = gr.Slider(
+                            minimum=0.0, maximum=1.0, value=0.2, step=0.1, label="Temperature"
                         )
                     with gr.Row():
                         cmp_top_k = gr.Slider(minimum=3, maximum=20, value=8, step=1, label="Top-K")
-                        cmp_per_source_k = gr.Slider(
-                            minimum=1, maximum=5, value=2, step=1, label="Фрагм. на источник"
-                        )
-                    with gr.Row():
                         cmp_translate_mode = gr.Dropdown(
                             choices=["off", "query", "query_and_hits", "dual_query"],
                             value="dual_query",
                             label="Режим перевода",
                         )
-                        cmp_model = gr.Dropdown(
-                            choices=["alice", "yandex"], value="alice", label="Модель"
-                        )
-                    cmp_temperature = gr.Slider(
-                        minimum=0.0, maximum=1.0, value=0.2, step=0.1, label="Temperature"
-                    )
                     cmp_btn = gr.Button("Сравнить", variant="primary")
 
                 with gr.Column(scale=3):
@@ -400,10 +328,7 @@ with gr.Blocks(title="Evidentum") as demo:
 
             cmp_btn.click(
                 fn=compare_guidelines,
-                inputs=[
-                    cmp_question, cmp_specialty, cmp_nosology,
-                    cmp_top_k, cmp_per_source_k, cmp_translate_mode, cmp_model, cmp_temperature,
-                ],
+                inputs=[cmp_question, cmp_top_k, cmp_translate_mode, cmp_model, cmp_temperature],
                 outputs=[cmp_analysis, cmp_sources],
             )
 
