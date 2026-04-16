@@ -459,6 +459,87 @@ def split_text_by_size(
 
     return chunks
 
+def detect_document_sections(parsed: ParsedDocument) -> list[dict]:
+    text = normalize_whitespace(parsed.text)
+    if not text:
+        return []
+
+    sections = split_into_sections_by_headers(text)
+
+    # fallback: если секции не найдены, режем весь текст как один "безымянный" блок
+    if not sections:
+        return [{"section_title": None, "section_text": text}]
+
+    # для российских КР убираем мусорные секции и оставляем полезные верхние уровни
+    if (parsed.region or "").upper() == "RU":
+        sections = filter_sections(
+            sections,
+            keep_top_level_numbers=["1.", "2.", "3.", "4.", "5.", "6.", "7."],
+        )
+    else:
+        sections = filter_sections(sections)
+
+    if not sections:
+        return [{"section_title": None, "section_text": text}]
+
+    return sections
+
+
+def build_chunks_from_sections(
+    parsed: ParsedDocument,
+    *,
+    target_chars: int = 1200,
+    overlap_chars: int = 200,
+    min_chars: int = 150,
+    min_words: int = 5,
+) -> list[dict]:
+    sections = detect_document_sections(parsed)
+
+    chunks: list[dict] = []
+    for sec in sections:
+        section_title = normalize_heading_text(sec.get("section_title") or "") or None
+        section_text = sec.get("section_text") or ""
+
+        for chunk_body in split_section_text(
+            section_text,
+            target_chars=target_chars,
+            overlap_chars=overlap_chars,
+            min_chars=min_chars,
+            min_words=min_words,
+        ):
+            embedding_text = chunk_body
+            if section_title:
+                embedding_text = f"{section_title}\n\n{chunk_body}"
+
+            chunks.append(
+                {
+                    "section_title": section_title,
+                    "chunk_text": chunk_body,
+                    "embedding_text": embedding_text,
+                    "char_count": len(chunk_body),
+                }
+            )
+
+    # fallback на старый режим, если вдруг всё отфильтровалось
+    if not chunks:
+        for chunk in chunk_text(
+            parsed.text,
+            target_chars=target_chars,
+            overlap_chars=overlap_chars,
+            min_chars=min_chars,
+            min_words=min_words,
+        ):
+            chunks.append(
+                {
+                    "section_title": chunk.get("section_title"),
+                    "chunk_text": chunk["chunk_text"],
+                    "embedding_text": chunk["chunk_text"],
+                    "char_count": chunk["char_count"],
+                }
+            )
+
+    return chunks
+
 def chunk_text(
     text: str,
     *,
@@ -538,8 +619,8 @@ def upsert_document(
             session.add(document)
             session.flush()
 
-        chunks = chunk_text(
-            parsed.text,
+        chunks = build_chunks_from_sections(
+            parsed,
             target_chars=target_chars,
             overlap_chars=overlap_chars,
         )
@@ -549,8 +630,8 @@ def upsert_document(
                 Chunk(
                     document_id=document.id,
                     chunk_index=idx,
-                    section_title=None,
-                    chunk_text=chunk["chunk_text"],
+                    section_title=chunk["section_title"],
+                    chunk_text=chunk["embedding_text"],   # section_title участвует в эмбеддингах
                     char_count=chunk["char_count"],
                     metadata_json={
                         "source_id": parsed.source_id,
@@ -560,6 +641,8 @@ def upsert_document(
                         "region": parsed.region,
                         "year": parsed.year,
                         "file_path": parsed.file_path,
+                        "section_title": chunk["section_title"],
+                        "display_text": chunk["chunk_text"],  # для UI/ответа можно брать чистый текст
                     },
                 )
             )

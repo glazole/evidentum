@@ -253,6 +253,17 @@ def should_translate_query(query: str, mode: TranslateMode) -> bool:
 def clamp_top_k(value: int) -> int:
     return max(1, min(value, 50))
 
+RAW_CANDIDATE_MIN = int(os.getenv("RETRIEVER_RAW_CANDIDATE_MIN", "24"))
+RAW_CANDIDATE_MULTIPLIER = int(os.getenv("RETRIEVER_RAW_CANDIDATE_MULTIPLIER", "4"))
+MAX_HITS_PER_DOCUMENT = int(os.getenv("RETRIEVER_MAX_HITS_PER_DOCUMENT", "2"))
+
+RU_PRIORITY_BONUS = float(os.getenv("RETRIEVER_RU_PRIORITY_BONUS", "0.05"))
+SECTION_PREFERRED_BONUS = float(os.getenv("RETRIEVER_SECTION_PREFERRED_BONUS", "0.04"))
+SECTION_NOISE_PENALTY = float(os.getenv("RETRIEVER_SECTION_NOISE_PENALTY", "0.08"))
+LEXICAL_OVERLAP_MAX_BONUS = float(os.getenv("RETRIEVER_LEXICAL_OVERLAP_MAX_BONUS", "0.08"))
+
+def raw_candidate_top_k(top_k: int) -> int:
+    return max(clamp_top_k(top_k) * RAW_CANDIDATE_MULTIPLIER, RAW_CANDIDATE_MIN)
 
 def build_retrieval_stmt(
     query_embedding: list[float],
@@ -331,6 +342,7 @@ def fetch_hits_for_embedding(
 def merge_and_rerank_hits(
     *hits_lists: Iterable[RetrievalHit],
     top_k: int,
+    query: str,
 ) -> list[RetrievalHit]:
     best_by_chunk_id: dict[int, RetrievalHit] = {}
 
@@ -342,21 +354,39 @@ def merge_and_rerank_hits(
                 best_by_chunk_id[hit.chunk_id] = hit
                 continue
 
-            # объединяем источники
             existing_sources = set(existing.retrieval_source or [])
             new_sources = set(hit.retrieval_source or [])
-            existing.retrieval_source = list(existing_sources | new_sources)
+            merged_sources = list(existing_sources | new_sources)
 
-            # если новый hit лучше — обновляем метрики и текст
+            # оставляем лучший по distance hit
             if hit.distance < existing.distance:
-                existing.distance = hit.distance
-                existing.score = hit.score
-                existing.chunk_text = hit.chunk_text
-                existing.section_title = hit.section_title
+                hit.retrieval_source = merged_sources
+                best_by_chunk_id[hit.chunk_id] = hit
+            else:
+                existing.retrieval_source = merged_sources
 
-    merged = list(best_by_chunk_id.values())
-    merged.sort(key=lambda x: (x.distance, x.document_id, x.chunk_index))
-    return merged[:clamp_top_k(top_k)]
+    query_terms = extract_query_terms(query)
+
+    merged_hits = list(best_by_chunk_id.values())
+
+    for hit in merged_hits:
+        hit.score = rerank_score(hit, query_terms)
+
+    merged_hits.sort(
+        key=lambda x: (
+            -x.score,
+            x.distance,
+            x.document_id,
+            x.chunk_index,
+        )
+    )
+
+    merged_hits = limit_hits_per_document(
+        merged_hits,
+        max_hits_per_document=MAX_HITS_PER_DOCUMENT,
+    )
+
+    return merged_hits[:clamp_top_k(top_k)]
 
 def score_from_distance(distance: float) -> float:
     # cosine distance in pgvector: lower is better; similarity-like score for UI.
@@ -366,6 +396,150 @@ def score_from_distance(distance: float) -> float:
     if score > 1.0:
         return 1.0
     return score
+
+TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-\+\.]{1,}")
+
+PREFERRED_SECTION_PATTERNS = (
+    "лечение",
+    "терап",
+    "диагност",
+    "профилакти",
+    "ведение",
+    "management",
+    "treatment",
+    "therapy",
+    "diagnos",
+    "recommend",
+)
+
+NOISE_SECTION_PATTERNS = (
+    "оглавление",
+    "содержание",
+    "список литературы",
+    "references",
+    "appendix",
+    "table of contents",
+    "abbreviations",
+    "glossary",
+)
+
+
+def extract_query_terms(query: str) -> list[str]:
+    """
+    Берём только относительно полезные токены из текущего вопроса.
+    Это универсально и не привязано к конкретной теме.
+    """
+    raw_terms = TOKEN_RE.findall((query or "").lower())
+
+    stopwords = {
+        "и", "в", "во", "на", "с", "со", "к", "ко", "по", "о", "об", "от", "до",
+        "the", "a", "an", "of", "for", "to", "in", "on", "with", "and", "or",
+        "как", "что", "при", "для", "или", "у", "из", "над", "под",
+        "is", "are", "was", "were", "be", "this", "that",
+    }
+
+    terms: list[str] = []
+    for term in raw_terms:
+        if len(term) < 3:
+            continue
+        if term in stopwords:
+            continue
+        if term.isdigit():
+            continue
+        terms.append(term)
+
+    # сохраняем порядок, убираем дубли
+    return list(dict.fromkeys(terms))
+
+
+def normalize_for_match(text: str | None) -> str:
+    return (text or "").lower()
+
+
+def compute_lexical_overlap_bonus(hit: RetrievalHit, query_terms: list[str]) -> float:
+    if not query_terms:
+        return 0.0
+
+    haystack = " ".join(
+        filter(
+            None,
+            [
+                normalize_for_match(hit.title),
+                normalize_for_match(hit.section_title),
+                normalize_for_match(hit.chunk_text),
+            ],
+        )
+    )
+
+    matched = 0
+    for term in query_terms:
+        if term in haystack:
+            matched += 1
+
+    if matched == 0:
+        return 0.0
+
+    ratio = matched / max(len(query_terms), 1)
+    return min(ratio * LEXICAL_OVERLAP_MAX_BONUS, LEXICAL_OVERLAP_MAX_BONUS)
+
+
+def compute_section_bonus(hit: RetrievalHit) -> float:
+    section = normalize_for_match(hit.section_title)
+
+    if not section:
+        return 0.0
+
+    if any(pattern in section for pattern in NOISE_SECTION_PATTERNS):
+        return -SECTION_NOISE_PENALTY
+
+    if any(pattern in section for pattern in PREFERRED_SECTION_PATTERNS):
+        return SECTION_PREFERRED_BONUS
+
+    return 0.0
+
+
+def compute_region_bonus(hit: RetrievalHit) -> float:
+    region = normalize_for_match(hit.region)
+    source_id = normalize_for_match(hit.source_id)
+
+    if region == "ru":
+        return RU_PRIORITY_BONUS
+
+    # fallback на source_id, если region не заполнен
+    if source_id.startswith("ru_") or source_id.startswith("кр") or "minzdrav" in source_id:
+        return RU_PRIORITY_BONUS
+
+    return 0.0
+
+
+def rerank_score(hit: RetrievalHit, query_terms: list[str]) -> float:
+    base_score = score_from_distance(hit.distance)
+    final_score = (
+        base_score
+        + compute_region_bonus(hit)
+        + compute_section_bonus(hit)
+        + compute_lexical_overlap_bonus(hit, query_terms)
+    )
+    return final_score
+
+
+def limit_hits_per_document(
+    hits: list[RetrievalHit],
+    *,
+    max_hits_per_document: int = MAX_HITS_PER_DOCUMENT,
+) -> list[RetrievalHit]:
+    limited: list[RetrievalHit] = []
+    per_doc_counter: dict[int, int] = {}
+
+    for hit in hits:
+        used = per_doc_counter.get(hit.document_id, 0)
+        if used >= max_hits_per_document:
+            continue
+
+        limited.append(hit)
+        per_doc_counter[hit.document_id] = used + 1
+
+    return limited
 
 
 def translate_hits_if_needed(
@@ -459,7 +633,7 @@ def retrieve(
         )
         ru_hits = fetch_hits_for_embedding(
             query_embedding=raw_query_embedding,
-            top_k=max(top_k, 8),
+            top_k=raw_candidate_top_k(top_k),
             retrieval_source="ru_pass",
             document_id=document_id,
             source_id=source_id,
@@ -486,14 +660,19 @@ def retrieve(
             )
             translated_hits = fetch_hits_for_embedding(
                 query_embedding=translated_query_embedding,
-                top_k=max(top_k, 8),
+                top_k=raw_candidate_top_k(top_k),
                 retrieval_source="en_pass",
                 document_id=document_id,
                 source_id=source_id,
                 region=region,
             )
 
-        hits = merge_and_rerank_hits(ru_hits, translated_hits, top_k=top_k)
+        hits = merge_and_rerank_hits(
+            ru_hits,
+            translated_hits,
+            top_k=top_k,
+            query=raw_query,
+        )
 
     else:
         if should_translate_query(raw_query, translate_mode) and translator is not None:
@@ -517,11 +696,17 @@ def retrieve(
 
         hits = fetch_hits_for_embedding(
             query_embedding=query_embedding,
-            top_k=top_k,
+            top_k=raw_candidate_top_k(top_k),
             retrieval_source="translated_query" if query_translation is not None else "raw_query",
             document_id=document_id,
             source_id=source_id,
             region=region,
+        )
+
+        hits = merge_and_rerank_hits(
+            hits,
+            top_k=top_k,
+            query=raw_query,
         )
 
     hits = translate_hits_if_needed(
