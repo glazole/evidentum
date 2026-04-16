@@ -36,6 +36,53 @@ services:
       - ./:/app
     working_dir: /app
     command: ["sleep", "infinity"]
+  
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mvp_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-medguides}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: >
+      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"
+    ports:
+      - "127.0.0.1:18000:8000"
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mvp_ui
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      UI_API_BASE_URL: http://api:8000/api
+    depends_on:
+      - api
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: >
+      sh -c "python -m app.ui"
+    ports:
+      - "127.0.0.1:17860:7860"
 
 volumes:
   postgres_data:
+
+networks:
+  drug-code-resolver_mvp-net:
+    external: true
