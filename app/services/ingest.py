@@ -525,7 +525,7 @@ def split_section_text(
     *,
     target_chars: int = 1200,
     overlap_chars: int = 200,
-    min_chars: int = 150,
+    min_chars: int = 80,
     min_words: int = 5,
 ) -> list[str]:
     text = normalize_whitespace(text)
