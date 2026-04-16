@@ -76,11 +76,12 @@ class AnswerRequest(BaseModel):
 
 class CompareRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    top_k: int = Field(default=8, ge=1, le=20)
+    top_k: int = Field(default=12, ge=1, le=30)
     translate_mode: TranslateMode = "dual_query"
     model: str = "alice"
     temperature: float = Field(default=0.2, ge=0.0, le=1.5)
-    per_source_k: int = Field(default=2, ge=1, le=5)
+    min_score: float = Field(default=0.35, ge=0.0, le=1.0)
+    max_chunks_per_source: int = Field(default=3, ge=1, le=6)
     specialty: str | None = None
     nosology: str | None = None
 
@@ -226,15 +227,14 @@ def answer_route(payload: AnswerRequest) -> dict[str, Any]:
 @router.post("/compare")
 def compare_route(payload: CompareRequest) -> dict[str, Any]:
     """
-    Retrieve top chunks across multiple guidelines and compare their positions
-    using LLM-based structured synthesis.
+    Semantic retrieval → group by source → drop sources below min_score →
+    LLM synthesis only over truly relevant guidelines.
     """
     try:
         retrieval = retrieve(
             payload.question,
             top_k=payload.top_k,
             translate_mode=payload.translate_mode,
-            per_source_k=payload.per_source_k,
             specialty=payload.specialty,
             nosology=payload.nosology,
         )
@@ -243,16 +243,38 @@ def compare_route(payload: CompareRequest) -> dict[str, Any]:
         if not hits:
             return {"question": payload.question, "sources": [], "comparison": "Фрагменты не найдены."}
 
-        # Group by source
+        # Group by source, keep top max_chunks_per_source per source
         by_source: dict[str, list[Any]] = {}
         for h in hits:
-            by_source.setdefault(h.source_id, []).append(h)
+            bucket = by_source.setdefault(h.source_id, [])
+            if len(bucket) < payload.max_chunks_per_source:
+                bucket.append(h)
 
-        # Build per-source position using the answerer
+        # Filter out sources where best chunk score is below threshold
+        relevant_sources = {
+            src_id: src_hits
+            for src_id, src_hits in by_source.items()
+            if max(h.score for h in src_hits) >= payload.min_score
+        }
+
+        if not relevant_sources:
+            return {
+                "question": payload.question,
+                "sources": [],
+                "comparison": (
+                    f"Ни один источник не набрал достаточного сходства "
+                    f"(порог score={payload.min_score}). "
+                    "Попробуйте переформулировать вопрос."
+                ),
+            }
+
+        # Flatten only relevant hits for synthesis
+        relevant_hits = [h for hits_list in relevant_sources.values() for h in hits_list]
+
         from app.services.answer import YandexOpenAIAnswerer, _normalize_sources
 
         answerer = YandexOpenAIAnswerer()
-        sources_list = _normalize_sources(hits)
+        sources_list = _normalize_sources(relevant_hits)
 
         structured = answerer.synthesize_structured(
             question=payload.question,
@@ -262,8 +284,9 @@ def compare_route(payload: CompareRequest) -> dict[str, Any]:
         )
 
         source_rows = []
-        for source_id, source_hits in by_source.items():
+        for source_id, source_hits in relevant_sources.items():
             first = source_hits[0]
+            best_score = max(h.score for h in source_hits)
             text_combined = "\n---\n".join(
                 (h.translated_chunk_text or h.chunk_text or "").strip()[:600]
                 for h in source_hits
@@ -277,8 +300,11 @@ def compare_route(payload: CompareRequest) -> dict[str, Any]:
                 "url": first.url,
                 "chunk_count": len(source_hits),
                 "combined_text": text_combined,
-                "score": max(h.score for h in source_hits),
+                "score": round(best_score, 3),
             })
+
+        # Sort by score descending
+        source_rows.sort(key=lambda r: r["score"], reverse=True)
 
         return {
             "question": payload.question,

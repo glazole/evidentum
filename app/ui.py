@@ -212,21 +212,23 @@ def _compare(
 
     sources = data.get("sources") or []
 
-    # Per-source positions
+    # Per-source positions (already sorted by score desc from API)
     pos_parts: list[str] = []
     for s in sources:
         name = s.get("source_name") or s.get("source_id") or "-"
         year = s.get("year") or "-"
         region = (s.get("region") or "-").upper()
         url = s.get("url")
+        score = s.get("score")
         text = (s.get("combined_text") or "").strip()
         if len(text) > 800:
             text = text[:800].rstrip() + " …"
-        header = f"### {name} ({region}, {year})"
+        score_str = f" `score={score:.2f}`" if score is not None else ""
+        header = f"### {name} ({region}, {year}){score_str}"
         if url:
             header += f" — [источник]({url})"
         pos_parts.append(f"{header}\n\n{text}" if text else header)
-    positions_md = "\n\n---\n\n".join(pos_parts) if pos_parts else "Фрагменты не найдены."
+    positions_md = "\n\n---\n\n".join(pos_parts) if pos_parts else "По данному вопросу релевантные источники не найдены."
 
     # Synthesis
     consensus = data.get("consensus")
