@@ -54,6 +54,14 @@ KR_CANONICAL_SECTION_TITLES = [
     "7. Дополнительная информация (в том числе факторы, влияющие на исход заболевания или состояния)",
 ]
 
+def normalize_whitespace(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = text.replace("\u200b", "")
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def normalize_kr_title_for_match(text: str) -> str:
     text = normalize_whitespace(text)
     text = text.replace("ё", "е").replace("Ё", "Е")
@@ -66,6 +74,110 @@ KR_CANONICAL_SECTION_MAP = {
     normalize_kr_title_for_match(title): title
     for title in KR_CANONICAL_SECTION_TITLES
 }
+
+KNOWN_CANONICAL_URLS = {
+    "ru_af": "https://cr.minzdrav.gov.ru/preview-cr/382_2",
+    "esc_af_2024": "https://academic.oup.com/eurheartj/article/45/36/3314/7738779",
+    "aha_af_2023": "https://www.ahajournals.org/doi/10.1161/CIR.0000000000001193",
+}
+
+
+def infer_document_identity(
+    *,
+    file_stem: str,
+    text: str,
+    title: str,
+    url: Optional[str] = None,
+    explicit_source_id: Optional[str] = None,
+    explicit_source_name: Optional[str] = None,
+    explicit_region: Optional[str] = None,
+) -> dict:
+    """
+    Автоопределение region/source_id/source_name/url.
+    Приоритет:
+    1) явные аргументы пользователя
+    2) точные правила под известные документы MVP
+    3) более общие эвристики по домену / содержимому
+    4) fallback
+    """
+    norm_stem = normalize_whitespace(file_stem).lower()
+    norm_title = normalize_whitespace(title).lower()
+    norm_url = (url or "").lower()
+    text_head = normalize_whitespace(text[:8000]).lower()
+
+    haystack = " | ".join(
+        part for part in [norm_stem, norm_title, norm_url, text_head] if part
+    )
+
+    detected_source_id: Optional[str] = None
+    detected_source_name: Optional[str] = None
+    detected_region: Optional[str] = None
+    detected_url: Optional[str] = url
+
+    # -----------------------------
+    # 1. Точные правила под текущий MVP
+    # -----------------------------
+
+    # Российские КР по ФП
+    if (
+        "preview-cr/382_2" in norm_url
+        or "кр382" in haystack
+        or "kp382" in haystack
+        or ("фибрилляц" in haystack and "клиническ" in haystack and "минздрав" in haystack)
+    ):
+        detected_source_id = "кр382_2_new"
+        detected_source_name = "Клинические рекомендации Минздрав РФ — Фибрилляция предсердий"
+        detected_region = "RU"
+        detected_url = KNOWN_CANONICAL_URLS["ru_af"]
+
+    # ESC 2024
+    elif (
+        "7738779" in norm_url
+        or "ehae176" in haystack
+        or "2024 esc guidelines for the management" in haystack
+        or ("esc" in haystack and "atrial fibrillation" in haystack)
+        or ("eur heart j" in haystack and "atrial fibrillation" in haystack)
+    ):
+        detected_source_id = "ehae176_new"
+        detected_source_name = "2024 ESC Guidelines for the management of atrial fibrillation"
+        detected_region = "EU"
+        detected_url = KNOWN_CANONICAL_URLS["esc_af_2024"]
+
+    # AHA/ACC/HRS 2023
+    elif (
+        "cir.0000000000001193" in norm_url
+        or "joglar" in haystack
+        or "acc/aha/accp/hrs" in haystack
+        or "2023 acc/aha/accp/hrs guideline" in haystack
+        or ("circulation" in haystack and "atrial fibrillation" in haystack)
+    ):
+        detected_source_id = "joglar-et-al-2023-2023-acc-aha-accp-hrs-guideline_new"
+        detected_source_name = "2023 ACC/AHA/ACCP/HRS Guideline for the Diagnosis and Management of Atrial Fibrillation"
+        detected_region = "US"
+        detected_url = KNOWN_CANONICAL_URLS["aha_af_2023"]
+
+    # -----------------------------
+    # 2. Более общие эвристики
+    # -----------------------------
+    else:
+        if "cr.minzdrav.gov.ru" in norm_url or "минздрав" in haystack:
+            detected_region = "RU"
+        elif any(domain in norm_url for domain in ["escardio.org", "academic.oup.com"]):
+            detected_region = "EU"
+        elif any(domain in norm_url for domain in ["ahajournals.org", "professional.heart.org", "acc.org"]):
+            detected_region = "US"
+
+    final_source_id = explicit_source_id or detected_source_id or slugify(file_stem)
+    final_source_name = explicit_source_name or detected_source_name or file_stem
+    final_region = explicit_region or detected_region
+    final_url = url or detected_url
+
+    return {
+        "source_id": final_source_id,
+        "source_name": final_source_name,
+        "region": final_region,
+        "url": final_url,
+    }
 
 
 def is_likely_section_header(line: str, prev_line: Optional[str] = None) -> bool:
@@ -205,13 +317,6 @@ def filter_sections(sections: list[dict], keep_top_level_numbers: Optional[list[
             filtered.append(sec)
     return filtered
 
-def normalize_whitespace(text: str) -> str:
-    text = text.replace("\xa0", " ")
-    text = text.replace("\u200b", "")
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
 
 def normalize_heading_text(text: str) -> str:
     text = normalize_whitespace(text)
