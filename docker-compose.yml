@@ -17,6 +17,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    networks:
+      - mvp-net
 
   app:
     build:
@@ -36,7 +38,9 @@ services:
       - ./:/app
     working_dir: /app
     command: ["sleep", "infinity"]
-  
+    networks:
+      - mvp-net
+
   api:
     build:
       context: .
@@ -56,8 +60,15 @@ services:
     working_dir: /app
     command: >
       sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"
-    ports:
-      - "127.0.0.1:18000:8000"
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')\""]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    networks:
+      - mvp-net
 
   ui:
     build:
@@ -69,20 +80,24 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Europe/Moscow}
-      UI_API_BASE_URL: http://api:8000/api
+      UI_API_BASE_URL: http://mvp_api:8000/api
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     volumes:
       - ./:/app
     working_dir: /app
     command: >
       sh -c "python -m app.ui"
-    ports:
-      - "127.0.0.1:17860:7860"
+    expose:
+      - "7860"
+    networks:
+      - mvp-net
 
 volumes:
   postgres_data:
 
 networks:
-  drug-code-resolver_mvp-net:
+  mvp-net:
     external: true
+    name: drug-code-resolver_mvp-net
