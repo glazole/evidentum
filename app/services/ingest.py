@@ -54,6 +54,115 @@ KR_CANONICAL_SECTION_TITLES = [
     "7. Дополнительная информация (в том числе факторы, влияющие на исход заболевания или состояния)",
 ]
 
+
+def is_likely_section_header(line: str, prev_line: Optional[str] = None) -> bool:
+    """Эвристическое определение строки как заголовка раздела."""
+    line = line.strip()
+    if not line or len(line) > 200:
+        return False
+
+    # Паттерны нумерации (русские и английские)
+    # "1.", "1.1", "1.1.1", "1)", "1.1)", "Глава 1.", "Chapter 1.", "Section 1."
+    if re.match(r'^(\d+([.-]?\d+)*|(Глава|Раздел|Chapter|Section|Part)\s+)\s*[\.\)]?\s*\d+', line, re.IGNORECASE):
+        # Должно быть хотя бы ещё слово после номера
+        if len(line.split()) > 1:
+            return True
+
+    # Короткие строки в верхнем регистре (например, "СПИСОК ЛИТЕРАТУРЫ", "REFERENCES")
+    if line.isupper() and len(line) > 4 and len(line.split()) >= 2:
+        return True
+
+    # Строки, начинающиеся с заглавной, не слишком длинные, и предыдущая строка пустая
+    if prev_line and not prev_line.strip() and line[0].isupper() and len(line) < 100:
+        # Исключаем явно не-заголовки (например, "Иванов И.И., ...")
+        if not re.match(r'^[А-ЯA-Z][а-яa-z]+,', line):
+            return True
+
+    return False
+
+def split_into_sections_by_headers(text: str) -> list[dict]:
+    """Разбивает текст на секции, используя is_likely_section_header."""
+    lines = text.splitlines()
+    if not lines:
+        return []
+
+    sections = []
+    current_title = None
+    current_content = []
+    prev_line = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            # Пустые строки не добавляем в контент, но запоминаем для эвристики
+            prev_line = line
+            continue
+
+        is_header = is_likely_section_header(line, prev_line)
+
+        if is_header:
+            # Сохраняем предыдущую секцию
+            if current_title:
+                content = "\n".join(current_content).strip()
+                if content:
+                    sections.append({
+                        "section_title": current_title,
+                        "section_text": content
+                    })
+            # Начинаем новую
+            current_title = line[:512]
+            current_content = []
+        else:
+            # Если мы ещё не внутри секции (начало документа), пропускаем текст до первого заголовка
+            if current_title is not None:
+                current_content.append(raw_line)  # сохраняем исходный перенос строк
+
+        prev_line = line
+
+    # Последняя секция
+    if current_title and current_content:
+        content = "\n".join(current_content).strip()
+        if content:
+            sections.append({
+                "section_title": current_title,
+                "section_text": content
+            })
+
+    return sections
+
+def is_toc_or_reference_section(section_title: str) -> bool:
+    """Проверяет, является ли секция оглавлением, списком литературы, приложением и т.п."""
+    title = section_title.lower()
+    # Список стоп-слов (русские и английские)
+    stop_patterns = [
+        r'^оглавление$', r'^содержание$', r'^список литературы$', r'^references?$',
+        r'^приложение', r'^appendix', r'^table of contents', r'^список сокращений',
+        r'^термины и определения',  # часто идёт перед разделами
+    ]
+    for pattern in stop_patterns:
+        if re.match(pattern, title):
+            return True
+    return False
+
+def filter_sections(sections: list[dict], keep_top_level_numbers: Optional[list[str]] = None) -> list[dict]:
+    """
+    Фильтрует секции:
+    - удаляет секции, помеченные как оглавление/литература
+    - если указан keep_top_level_numbers, оставляет только секции, чей заголовок начинается с этих чисел
+    """
+    filtered = []
+    for sec in sections:
+        if is_toc_or_reference_section(sec["section_title"]):
+            continue
+        if keep_top_level_numbers:
+            # Проверяем, начинается ли заголовок с одного из номеров (например, "1.", "2.")
+            title = sec["section_title"]
+            if any(title.startswith(num) for num in keep_top_level_numbers):
+                filtered.append(sec)
+        else:
+            filtered.append(sec)
+    return filtered
+
 def normalize_whitespace(text: str) -> str:
     text = text.replace("\xa0", " ")
     text = text.replace("\u200b", "")
@@ -75,44 +184,6 @@ KR_CANONICAL_SECTION_MAP = {
     for title in KR_CANONICAL_SECTION_TITLES
 }
 
-def split_kr_into_canonical_sections(text: str) -> list[dict]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return []
-
-    sections: list[dict] = []
-    current_title: Optional[str] = None
-    current_lines: list[str] = []
-
-    def flush_section() -> None:
-        nonlocal current_title, current_lines
-        if current_title is None:
-            current_lines = []
-            return
-
-        body = "\n".join(current_lines).strip()
-        if body:
-            sections.append(
-                {
-                    "section_title": current_title,
-                    "section_text": body,
-                }
-            )
-        current_lines = []
-
-    for raw_line in lines:
-        normalized_line = normalize_kr_title_for_match(raw_line)
-
-        if normalized_line in KR_CANONICAL_SECTION_MAP:
-            flush_section()
-            current_title = KR_CANONICAL_SECTION_MAP[normalized_line]
-            continue
-
-        if current_title is not None:
-            current_lines.append(normalize_whitespace(raw_line))
-
-    flush_section()
-    return sections
 
 def normalize_heading_text(text: str) -> str:
     text = normalize_whitespace(text)
@@ -120,87 +191,6 @@ def normalize_heading_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text[:512]
 
-
-def is_ru_clinical_recommendation(parsed: ParsedDocument) -> bool:
-    source = f"{parsed.source_id} {parsed.source_name} {parsed.title}".lower()
-    body = parsed.text[:5000].lower()
-    return (
-        "кр" in source
-        or "clinical_rekom" in source
-        or "клиническ" in body
-        or "оглавление" in body
-    )
-
-
-def is_kr_heading(paragraph: str) -> bool:
-    paragraph = normalize_heading_text(paragraph)
-    if not paragraph or len(paragraph) > 500:
-        return False
-    return KR_SECTION_HEADING_RE.match(paragraph) is not None
-
-
-def extract_kr_sections_1_to_7(text: str) -> str:
-    """
-    Keeps only real top-level sections 1..7 from Russian clinical recommendations.
-    Skips the table of contents and starts from the main body.
-    """
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return text
-
-    normalized_lines = [normalize_heading_text(line) for line in lines]
-
-    # Find where the real body starts:
-    # after "Термины и определения" and then the next top-level section 1.
-    terms_idx = None
-    for i, line in enumerate(normalized_lines):
-        if line.startswith("Термины и определения"):
-            terms_idx = i
-            break
-
-    start_idx = None
-    search_from = (terms_idx + 1) if terms_idx is not None else 0
-
-    for i in range(search_from, len(normalized_lines)):
-        line = normalized_lines[i]
-        top_match = KR_TOP_LEVEL_HEADING_RE.match(line)
-        if top_match and int(top_match.group("num")) == 1:
-            start_idx = i
-            break
-
-    if start_idx is None:
-        return text
-
-    kept: list[str] = []
-    in_target_block = False
-
-    for i in range(start_idx, len(normalized_lines)):
-        line = normalized_lines[i]
-
-        top_match = KR_TOP_LEVEL_HEADING_RE.match(line)
-        if top_match:
-            top_num = int(top_match.group("num"))
-
-            if top_num == 1:
-                in_target_block = True
-
-            if in_target_block and 1 <= top_num <= 7:
-                kept.append(line)
-                continue
-
-            if in_target_block and top_num >= 8:
-                break
-
-        if in_target_block:
-            upper_line = line.upper()
-            if upper_line.startswith("СПИСОК ЛИТЕРАТУРЫ") or upper_line.startswith("ПРИЛОЖЕНИЕ"):
-                break
-            kept.append(line)
-
-    if not kept:
-        return text
-
-    return "\n".join(kept)
 
 
 def sha256_text(value: str) -> str:
@@ -434,109 +424,6 @@ def split_section_text(
 
     return chunks
 
-
-def build_sections(text: str) -> list[dict]:
-    lines = [normalize_heading_text(line) for line in text.splitlines() if line.strip()]
-    if not lines:
-        return []
-
-    top_heading_re = re.compile(r"^(?P<num>[1-9])(?:[.)])?\s+(?P<title>\S.*)$")
-
-    sections: list[dict] = []
-    current_title: Optional[str] = None
-    current_lines: list[str] = []
-
-    def flush_section() -> None:
-        nonlocal current_title, current_lines
-        if current_title and current_lines:
-            body = "\n".join(current_lines).strip()
-            if body:
-                sections.append(
-                    {
-                        "section_title": current_title,
-                        "section_text": body,
-                    }
-                )
-        current_lines = []
-
-    for line in lines:
-        match = top_heading_re.match(line)
-
-        if match:
-            flush_section()
-            current_title = line[:512]
-            continue
-
-        if current_title is not None:
-            current_lines.append(line)
-
-    flush_section()
-    return sections
-
-
-def is_real_kr_top_heading(line: str, expected_num: int) -> bool:
-    line = normalize_heading_text(line)
-    match = KR_TOP_LEVEL_HEADING_RE.match(line)
-    if not match:
-        return False
-
-    num = int(match.group("num"))
-    if num != expected_num:
-        return False
-
-    title = match.group("title").strip()
-    if not title:
-        return False
-
-    # Для реальных верхних разделов заголовок обычно начинается с заглавной буквы,
-    # а не с "эдоксабан", "апиксабан" и т.п.
-    first_char = title[0]
-    if not first_char.isalpha() or not first_char.isupper():
-        return False
-
-    # Слишком короткие строки типа "4) да" не считаем заголовками секций
-    if len(title) < 15:
-        return False
-
-    return True
-
-
-def split_kr_into_sections(text: str) -> list[dict]:
-    lines = [normalize_heading_text(line) for line in text.splitlines() if line.strip()]
-    if not lines:
-        return []
-
-    sections: list[dict] = []
-    current_title: Optional[str] = None
-    current_lines: list[str] = []
-    expected_num = 1
-
-    def flush_section() -> None:
-        nonlocal current_title, current_lines
-        if current_title:
-            body = "\n".join(current_lines).strip()
-            if body:
-                sections.append(
-                    {
-                        "section_title": current_title,
-                        "section_text": body,
-                    }
-                )
-        current_lines = []
-
-    for line in lines:
-        if expected_num <= 7 and is_real_kr_top_heading(line, expected_num):
-            flush_section()
-            current_title = line[:512]
-            expected_num += 1
-            continue
-
-        if current_title is not None:
-            current_lines.append(line)
-
-    flush_section()
-    return sections
-
 def split_text_by_size(
     text: str,
     *,
@@ -580,32 +467,27 @@ def chunk_text(
     min_chars: int = 150,
     min_words: int = 5,
 ) -> list[dict]:
-    sections = split_kr_into_canonical_sections(text)
-    if not sections:
+    text = normalize_whitespace(text)
+    if not text:
         return []
 
+    text_chunks = split_text_by_size(
+        text,
+        target_chars=target_chars,
+        overlap_chars=overlap_chars,
+        min_chars=min_chars,
+        min_words=min_words,
+    )
+
     chunks: list[dict] = []
-
-    for section in sections:
-        section_title = section["section_title"]
-        section_text = section["section_text"]
-
-        section_chunks = split_text_by_size(
-            section_text,
-            target_chars=target_chars,
-            overlap_chars=overlap_chars,
-            min_chars=min_chars,
-            min_words=min_words,
+    for chunk_body in text_chunks:
+        chunks.append(
+            {
+                "section_title": None,
+                "chunk_text": chunk_body,
+                "char_count": len(chunk_body),
+            }
         )
-
-        for chunk_body in section_chunks:
-            chunks.append(
-                {
-                    "section_title": section_title,
-                    "chunk_text": chunk_body,
-                    "char_count": len(chunk_body),
-                }
-            )
 
     return chunks
 
@@ -623,11 +505,6 @@ def upsert_document(
 
         if existing and existing.checksum == parsed.checksum and not force_reingest:
             return existing, len(existing.chunks), False
-
-        text_for_chunks = parsed.text
-
-        if is_ru_clinical_recommendation(parsed):
-            text_for_chunks = extract_kr_sections_1_to_7(parsed.text)
 
         if existing:
             existing.source_name = parsed.source_name
@@ -662,7 +539,7 @@ def upsert_document(
             session.flush()
 
         chunks = chunk_text(
-            text_for_chunks,
+            parsed.text,
             target_chars=target_chars,
             overlap_chars=overlap_chars,
         )
@@ -672,7 +549,7 @@ def upsert_document(
                 Chunk(
                     document_id=document.id,
                     chunk_index=idx,
-                    section_title=chunk["section_title"],
+                    section_title=None,
                     chunk_text=chunk["chunk_text"],
                     char_count=chunk["char_count"],
                     metadata_json={
