@@ -122,20 +122,3 @@ class Chunk(Base):
 
     def __repr__(self) -> str:
         return f"Chunk(id={self.id}, document_id={self.document_id}, chunk_index={self.chunk_index})"
-
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-    __table_args__ = (
-        UniqueConstraint("email", "topic", name="uq_subscriptions_email_topic"),
-        Index("ix_subscriptions_email", "email"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    email: Mapped[str] = mapped_column(String(254), nullable=False)
-    topic: Mapped[str] = mapped_column(String(512), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
