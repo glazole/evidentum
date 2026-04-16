@@ -3,15 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 from openai import OpenAI
 
 try:
-    from app.services.retriever import retrieve
+    from app.services.retriever import RetrievalResult, retrieve
 except Exception:  # pragma: no cover
     retrieve = None  # type: ignore
+    RetrievalResult = None  # type: ignore
 
 
 YC_OPENAI_BASE_URL = os.getenv("YC_OPENAI_BASE_URL", "https://llm.api.cloud.yandex.net/v1")
@@ -30,6 +31,7 @@ MODEL_ALIASES = {
     "pro": "yandexgpt-5.1",
     "alice": "aliceai-llm",
     "aliceai": "aliceai-llm",
+    "lite": "yandexgpt-lite",
 }
 
 
@@ -43,6 +45,10 @@ class SourceItem:
     score: float | None
     chunk_text: str
     translated_chunk_text: str | None = None
+    summary: str | None = None
+    nosology: str | None = None
+    specialty: str | None = None
+    evidence_level: str | None = None
 
 
 @dataclass
@@ -54,6 +60,10 @@ class AnswerResult:
     disclaimer: str
     sources: list[SourceItem]
     raw_completion: dict[str, Any] | None = None
+    # Structured synthesis fields (filled when synthesize=True)
+    consensus: str | None = None
+    disagreements: list[dict[str, Any]] = field(default_factory=list)
+    recommendation: str | None = None
 
 
 class YandexOpenAIAnswerer:
@@ -92,33 +102,27 @@ class YandexOpenAIAnswerer:
     ) -> tuple[str, str, dict[str, Any] | None]:
         model_uri = self.build_model_uri(model_family)
 
-        system_prompt = (
-            "Ты медицинский ассистент для MVP по клиническим рекомендациям. "
-            "Отвечай только на основе переданных фрагментов. "
-            "Не выдумывай факты и не добавляй рекомендации, которых нет в источниках. "
-            "Пиши по-русски. "
-            "Структура ответа: 1) Краткий вывод; 2) Что говорят источники; "
-            "3) Различия между источниками; 4) Когда данных недостаточно. "
-            "После каждого утверждения ставь ссылки вида [1], [2]. "
-            "Если источников недостаточно, прямо так и напиши. "
-            "В конце добавь короткий дисклеймер: это не медицинская рекомендация и требуется подтверждение врачом."
-        )
+        system_prompt = _load_system_prompt()
 
         context_parts: list[str] = []
         for src in context_sources:
             snippet = (src.translated_chunk_text or src.chunk_text or "").strip()
             if len(snippet) > 1800:
                 snippet = snippet[:1800].rstrip() + " ..."
+            summary_line = f"summary={src.summary}\n" if src.summary else ""
+            evidence_line = f"evidence_level={src.evidence_level}\n" if src.evidence_level else ""
             context_parts.append(
                 "\n".join(
-                    [
+                    filter(None, [
                         f"[{src.index}] source_id={src.source_id or '-'}",
                         f"title={src.title or '-'}",
                         f"section={src.section_title or '-'}",
                         f"url={src.url or '-'}",
                         f"score={src.score if src.score is not None else '-'}",
+                        summary_line.rstrip() or None,
+                        evidence_line.rstrip() or None,
                         f"fragment={snippet}",
-                    ]
+                    ])
                 )
             )
 
@@ -142,12 +146,121 @@ class YandexOpenAIAnswerer:
         raw_payload = completion.model_dump() if return_raw and hasattr(completion, "model_dump") else None
         return answer.strip(), model_uri, raw_payload
 
+    def synthesize_structured(
+        self,
+        *,
+        question: str,
+        context_sources: list[SourceItem],
+        model_family: str | None = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    ) -> dict[str, Any]:
+        """
+        Generate a structured Консенсус/Расхождения/Рекомендация/Источники response.
+        Returns a JSON dict. Falls back to empty dict on failure.
+        """
+        model_uri = self.build_model_uri(model_family)
+
+        system_prompt = (
+            "Ты клинический ассистент. Отвечай ТОЛЬКО на русском языке. "
+            "Сохраняй латинские МНН-названия препаратов. "
+            "Используй ТОЛЬКО информацию из предоставленных фрагментов. "
+            "Если данных мало — скажи явно. "
+            "Верни строгий JSON без маркдаун-разметки:\n"
+            '{"consensus": "...", '
+            '"disagreements": [{"sources": ["..."], "text": "..."}], '
+            '"recommendation": "...", '
+            '"citations": [{"idx": 1, "source_name": "...", "section": "...", "url": "..."}]}'
+        )
+
+        # Group context by guideline (source_id)
+        grouped: dict[str, list[SourceItem]] = {}
+        for src in context_sources:
+            grouped.setdefault(src.source_id or "unknown", []).append(src)
+
+        context_parts: list[str] = []
+        for source_id, sources in grouped.items():
+            title = sources[0].title or source_id
+            context_parts.append(f"### {title} ({source_id})")
+            for src in sources:
+                text = (src.translated_chunk_text or src.chunk_text or "").strip()
+                summary = src.summary or ""
+                section = src.section_title or ""
+                evidence = f" [Уровень: {src.evidence_level}]" if src.evidence_level else ""
+                context_parts.append(
+                    f"[{src.index}] Раздел: {section}{evidence}\n"
+                    + (f"Резюме: {summary}\n" if summary else "")
+                    + f"Текст: {text[:1500]}"
+                )
+
+        user_prompt = (
+            f"Вопрос врача: {question}\n\n"
+            "Фрагменты из клинических рекомендаций:\n\n"
+            + "\n\n".join(context_parts)
+            + "\n\nВерни JSON-ответ строго по схеме выше."
+        )
+
+        import json as _json
+        import re as _re
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=model_uri,
+                temperature=temperature,
+                max_tokens=max_output_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            raw = (completion.choices[0].message.content or "").strip()
+
+            # Try direct parse
+            try:
+                return _json.loads(raw)
+            except _json.JSONDecodeError:
+                pass
+
+            # Strip markdown fences
+            stripped = _re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+            try:
+                return _json.loads(stripped)
+            except _json.JSONDecodeError:
+                pass
+
+            # Extract first {...} block
+            m = _re.search(r"\{.*\}", stripped, _re.DOTALL)
+            if m:
+                try:
+                    return _json.loads(m.group(0))
+                except _json.JSONDecodeError:
+                    pass
+        except Exception:
+            pass
+
+        return {}
+
+
+def _load_system_prompt() -> str:
+    prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "answer_system.txt")
+    try:
+        with open(prompt_path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return (
+            "Ты медицинский ассистент для MVP по клиническим рекомендациям. "
+            "Отвечай только на основе переданных фрагментов. "
+            "Не выдумывай факты. Пиши по-русски. "
+            "Сначала опирайся на российские рекомендации, зарубежные — для сравнения. "
+            "После утверждений ставь ссылки [1],[2]. "
+            "В конце добавь дисклеймер: это не медицинская рекомендация."
+        )
+
 
 def _safe_get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
-
 
 
 def _normalize_sources(hits: Iterable[Any]) -> list[SourceItem]:
@@ -163,10 +276,54 @@ def _normalize_sources(hits: Iterable[Any]) -> list[SourceItem]:
                 score=_safe_get(hit, "score"),
                 chunk_text=_safe_get(hit, "chunk_text", "") or "",
                 translated_chunk_text=_safe_get(hit, "translated_chunk_text"),
+                summary=_safe_get(hit, "summary"),
+                nosology=_safe_get(hit, "nosology"),
+                specialty=_safe_get(hit, "specialty"),
+                evidence_level=_safe_get(hit, "evidence_level"),
             )
         )
     return sources
 
+
+def _render_structured_markdown(structured: dict[str, Any]) -> str:
+    """Render Consensus/Disagreements/Recommendation/Sources as Markdown."""
+    lines: list[str] = []
+
+    consensus = structured.get("consensus")
+    if consensus:
+        lines += ["## ✅ Консенсус", str(consensus), ""]
+
+    disagreements = structured.get("disagreements") or []
+    if disagreements:
+        lines.append("## ⚡ Расхождения")
+        for item in disagreements:
+            sources = ", ".join(str(s) for s in (item.get("sources") or []))
+            text = str(item.get("text") or "")
+            lines.append(f"**{sources}:** {text}" if sources else text)
+        lines.append("")
+
+    recommendation = structured.get("recommendation")
+    if recommendation:
+        lines += ["## 💡 Итоговая рекомендация", str(recommendation), ""]
+
+    citations = structured.get("citations") or []
+    if citations:
+        lines.append("## 📎 Источники")
+        for c in citations:
+            idx = c.get("idx", "")
+            source_name = c.get("source_name", "")
+            section = c.get("section") or ""
+            url = c.get("url")
+            line = f"**[{idx}] {source_name}**"
+            if section:
+                line += f" — {section}"
+            if url:
+                line += f" ([ссылка]({url}))"
+            lines.append(line)
+        lines.append("")
+
+    lines.append("_Не является медицинской рекомендацией, требуется подтверждение врачом._")
+    return "\n".join(lines).strip()
 
 
 def answer_question(
@@ -178,17 +335,21 @@ def answer_question(
     temperature: float = DEFAULT_TEMPERATURE,
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     return_raw: bool = False,
+    synthesize: bool = True,
+    per_source_k: int | None = None,
+    specialty: str | None = None,
+    nosology: str | None = None,
 ) -> AnswerResult:
     if retrieve is None:
-        raise RuntimeError(
-            "app.services.retriever.retrieve is unavailable. "
-            "Place this file inside your project and make sure retriever.py is importable."
-        )
+        raise RuntimeError("app.services.retriever.retrieve is unavailable.")
 
     retrieval_result = retrieve(
         question,
         top_k=top_k,
         translate_mode=translate_mode,
+        per_source_k=per_source_k,
+        specialty=specialty,
+        nosology=nosology,
     )
 
     hits = _safe_get(retrieval_result, "hits", []) or []
@@ -202,10 +363,33 @@ def answer_question(
             answer="Недостаточно информации в найденных источниках для ответа на вопрос.",
             disclaimer="Не является медицинской рекомендацией, требуется подтверждение врачом.",
             sources=[],
-            raw_completion=None,
         )
 
     answerer = YandexOpenAIAnswerer()
+
+    if synthesize:
+        structured = answerer.synthesize_structured(
+            question=question,
+            context_sources=sources,
+            model_family=model_family,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        if structured:
+            answer_text = _render_structured_markdown(structured)
+            return AnswerResult(
+                question=question,
+                effective_query=_safe_get(retrieval_result, "effective_query"),
+                model=answerer.build_model_uri(model_family),
+                answer=answer_text,
+                disclaimer="Не является медицинской рекомендацией, требуется подтверждение врачом.",
+                sources=sources,
+                consensus=structured.get("consensus"),
+                disagreements=structured.get("disagreements") or [],
+                recommendation=structured.get("recommendation"),
+            )
+
+    # Fallback: plain grounded answer
     answer_text, model_uri, raw_payload = answerer.generate(
         question=question,
         context_sources=sources,
@@ -224,7 +408,6 @@ def answer_question(
         sources=sources,
         raw_completion=raw_payload,
     )
-
 
 
 def format_for_console(result: AnswerResult) -> str:
@@ -246,7 +429,6 @@ def format_for_console(result: AnswerResult) -> str:
     return "\n".join(parts)
 
 
-
 def format_for_ui(result: AnswerResult) -> dict[str, Any]:
     return {
         "answer": result.answer,
@@ -254,9 +436,11 @@ def format_for_ui(result: AnswerResult) -> dict[str, Any]:
         "effective_query": result.effective_query,
         "model": result.model,
         "disclaimer": result.disclaimer,
+        "consensus": result.consensus,
+        "disagreements": result.disagreements,
+        "recommendation": result.recommendation,
         "sources": [asdict(item) for item in result.sources],
     }
-
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -264,13 +448,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("question", nargs="?", help="Question for testing from console")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--translate-mode", default=DEFAULT_TRANSLATE_MODE)
-    parser.add_argument("--model", default=DEFAULT_MODEL_FAMILY, help="alice | yandex | full model id")
+    parser.add_argument("--model", default=DEFAULT_MODEL_FAMILY)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
+    parser.add_argument("--no-synthesize", action="store_true", help="Use plain grounded answer instead of structured synthesis")
     parser.add_argument("--json", action="store_true", help="Return UI-friendly JSON")
     parser.add_argument("--raw", action="store_true", help="Include raw OpenAI-compatible response")
     return parser
-
 
 
 def main() -> None:
@@ -289,19 +473,15 @@ def main() -> None:
         temperature=args.temperature,
         max_output_tokens=args.max_output_tokens,
         return_raw=args.raw,
+        synthesize=not args.no_synthesize,
     )
 
     if args.json:
         payload = format_for_ui(result)
-        if args.raw:
-            payload["raw_completion"] = result.raw_completion
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
     print(format_for_console(result))
-    if args.raw and result.raw_completion is not None:
-        print("\nRAW COMPLETION:\n")
-        print(json.dumps(result.raw_completion, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

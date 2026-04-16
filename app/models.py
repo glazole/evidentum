@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -15,7 +16,6 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-import os
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -55,6 +55,15 @@ class Document(Base):
         nullable=False,
     )
 
+    # LLM-enrichment + versioning
+    specialty: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    nosology_primary: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    summary_ru: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    previous_document_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    version_delta_ru: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     chunks: Mapped[list["Chunk"]] = relationship(
         "Chunk",
         back_populates="document",
@@ -73,6 +82,8 @@ class Chunk(Base):
         UniqueConstraint("document_id", "chunk_index", name="uq_chunks_document_chunk_index"),
         Index("ix_chunks_document_id", "document_id"),
         Index("ix_chunks_section_title", "section_title"),
+        Index("ix_chunks_nosology", "nosology"),
+        Index("ix_chunks_specialty", "specialty"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -89,6 +100,13 @@ class Chunk(Base):
 
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    # LLM-enrichment fields
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    nosology: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    specialty: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    topic: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    evidence_level: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
     embedding: Mapped[Optional[list[float]]] = mapped_column(
         Vector(EMBEDDING_DIM),
         nullable=True,
@@ -104,3 +122,20 @@ class Chunk(Base):
 
     def __repr__(self) -> str:
         return f"Chunk(id={self.id}, document_id={self.document_id}, chunk_index={self.chunk_index})"
+
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    __table_args__ = (
+        UniqueConstraint("email", "topic", name="uq_subscriptions_email_topic"),
+        Index("ix_subscriptions_email", "email"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(254), nullable=False)
+    topic: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )

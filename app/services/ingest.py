@@ -982,6 +982,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-chars", type=int, default=1200, help="Approx target chunk size.")
     parser.add_argument("--overlap-chars", type=int, default=200, help="Chunk overlap.")
     parser.add_argument("--force-reingest", action="store_true", help="Rebuild document and chunks even if checksum matches.")
+    parser.add_argument("--enrich", action="store_true", help="Run LLM enrichment (summary/nosology/specialty) after ingest.")
+    parser.add_argument("--enrich-model", default="yandex", help="LLM model family for enrichment (alice|yandex).")
 
     return parser
 
@@ -995,6 +997,8 @@ def main() -> None:
 
     init_db()
 
+    ingested_document_ids: list[int] = []
+
     if args.file:
         for file_path in args.file:
             result = ingest_file(
@@ -1007,6 +1011,8 @@ def main() -> None:
                 overlap_chars=args.overlap_chars,
             )
             print(result)
+            if result.get("document_id"):
+                ingested_document_ids.append(result["document_id"])
 
     if args.dir:
         dir_path = Path(args.dir)
@@ -1031,6 +1037,8 @@ def main() -> None:
                 overlap_chars=args.overlap_chars,
             )
             print(result)
+            if result.get("document_id"):
+                ingested_document_ids.append(result["document_id"])
 
     if args.url:
         for url in args.url:
@@ -1045,6 +1053,17 @@ def main() -> None:
                 overlap_chars=args.overlap_chars,
             )
             print(result)
+            if result.get("document_id"):
+                ingested_document_ids.append(result["document_id"])
+
+    if args.enrich and ingested_document_ids:
+        from app.services.enricher import enrich_chunks
+        from app.services.llm import YandexLLMClient
+        llm = YandexLLMClient(model_family=args.enrich_model)
+        for doc_id in ingested_document_ids:
+            print(f"[enrich] document_id={doc_id}")
+            stats = enrich_chunks(doc_id, llm=llm)
+            print(stats)
 
 
 if __name__ == "__main__":

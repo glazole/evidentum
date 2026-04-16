@@ -80,6 +80,13 @@ class RetrievalHit:
     char_count: int
     score: float
     distance: float
+    # LLM-enrichment fields
+    summary: str | None = None
+    nosology: str | None = None
+    specialty: str | None = None
+    topic: str | None = None
+    evidence_level: str | None = None
+    # retrieval metadata
     retrieval_source: list[str] | None = None   # raw_query | translated_query
     translated_chunk_text: str | None = None
     translation_detected_language: str | None = None
@@ -272,9 +279,65 @@ def build_retrieval_stmt(
     document_id: int | None = None,
     source_id: str | None = None,
     region: str | None = None,
+    specialty: str | None = None,
+    nosology: str | None = None,
     only_with_embeddings: bool = True,
+    per_source_k: int | None = None,
 ) -> Select:
+    from sqlalchemy import func as _func
+
     distance_expr = Chunk.embedding.cosine_distance(query_embedding)
+
+    if per_source_k is not None:
+        rn_expr = _func.row_number().over(
+            partition_by=Document.source_id,
+            order_by=distance_expr.asc(),
+        ).label("rn")
+        inner = (
+            select(
+                Chunk.id.label("chunk_id"),
+                Chunk.document_id,
+                Chunk.chunk_index,
+                Chunk.section_title,
+                Chunk.chunk_text,
+                Chunk.char_count,
+                Chunk.summary,
+                Chunk.nosology,
+                Chunk.specialty,
+                Chunk.topic,
+                Chunk.evidence_level,
+                Document.id.label("doc_id"),
+                Document.source_id,
+                Document.source_name,
+                Document.title,
+                Document.region,
+                Document.year,
+                Document.url,
+                Document.file_path,
+                distance_expr.label("distance"),
+                rn_expr,
+            )
+            .join(Document, Document.id == Chunk.document_id)
+        )
+        if only_with_embeddings:
+            inner = inner.where(Chunk.embedding.is_not(None))
+        if document_id is not None:
+            inner = inner.where(Chunk.document_id == document_id)
+        if source_id:
+            inner = inner.where(Document.source_id == source_id)
+        if region:
+            inner = inner.where(Document.region == region)
+        if specialty:
+            inner = inner.where(Chunk.specialty == specialty)
+        if nosology:
+            inner = inner.where(Chunk.nosology.ilike(f"%{nosology}%"))
+        subq = inner.subquery()
+        return (
+            select(subq)
+            .where(subq.c.rn <= per_source_k)
+            .order_by(subq.c.distance.asc())
+            .limit(clamp_top_k(top_k))
+        )
 
     stmt = (
         select(Chunk, Document, distance_expr.label("distance"))
@@ -291,8 +354,40 @@ def build_retrieval_stmt(
         stmt = stmt.where(Document.source_id == source_id)
     if region:
         stmt = stmt.where(Document.region == region)
+    if specialty:
+        stmt = stmt.where(Chunk.specialty == specialty)
+    if nosology:
+        stmt = stmt.where(Chunk.nosology.ilike(f"%{nosology}%"))
 
     return stmt
+
+
+def _hit_from_row(chunk: Any, document: Any, distance: float, retrieval_source: str) -> RetrievalHit:
+    dist = float(distance)
+    return RetrievalHit(
+        chunk_id=chunk.id,
+        document_id=chunk.document_id,
+        chunk_index=chunk.chunk_index,
+        source_id=document.source_id,
+        source_name=document.source_name,
+        title=document.title,
+        region=document.region,
+        year=document.year,
+        url=document.url,
+        file_path=document.file_path,
+        section_title=chunk.section_title,
+        chunk_text=chunk.chunk_text,
+        char_count=chunk.char_count,
+        summary=getattr(chunk, "summary", None),
+        nosology=getattr(chunk, "nosology", None),
+        specialty=getattr(chunk, "specialty", None),
+        topic=getattr(chunk, "topic", None),
+        evidence_level=getattr(chunk, "evidence_level", None),
+        distance=dist,
+        score=score_from_distance(dist),
+        retrieval_source=[retrieval_source],
+    )
+
 
 def fetch_hits_for_embedding(
     *,
@@ -302,41 +397,59 @@ def fetch_hits_for_embedding(
     document_id: int | None = None,
     source_id: str | None = None,
     region: str | None = None,
+    specialty: str | None = None,
+    nosology: str | None = None,
+    per_source_k: int | None = None,
 ) -> list[RetrievalHit]:
-    with session_scope() as session:
-        rows = session.execute(
-            build_retrieval_stmt(
-                query_embedding,
-                top_k=top_k,
-                document_id=document_id,
-                source_id=source_id,
-                region=region,
-            )
-        ).all()
+    stmt = build_retrieval_stmt(
+        query_embedding,
+        top_k=top_k,
+        document_id=document_id,
+        source_id=source_id,
+        region=region,
+        specialty=specialty,
+        nosology=nosology,
+        per_source_k=per_source_k,
+    )
 
-    hits: list[RetrievalHit] = []
+    with session_scope() as session:
+        if per_source_k is not None:
+            rows_mapped = session.execute(stmt).mappings().all()
+            hits: list[RetrievalHit] = []
+            for row in rows_mapped:
+                dist = float(row["distance"])
+                hits.append(
+                    RetrievalHit(
+                        chunk_id=row["chunk_id"],
+                        document_id=row["document_id"],
+                        chunk_index=row["chunk_index"],
+                        source_id=row["source_id"],
+                        source_name=row["source_name"],
+                        title=row["title"],
+                        region=row["region"],
+                        year=row["year"],
+                        url=row["url"],
+                        file_path=row["file_path"],
+                        section_title=row["section_title"],
+                        chunk_text=row["chunk_text"],
+                        char_count=row["char_count"],
+                        summary=row.get("summary"),
+                        nosology=row.get("nosology"),
+                        specialty=row.get("specialty"),
+                        topic=row.get("topic"),
+                        evidence_level=row.get("evidence_level"),
+                        distance=dist,
+                        score=score_from_distance(dist),
+                        retrieval_source=[retrieval_source],
+                    )
+                )
+            return hits
+
+        rows = session.execute(stmt).all()
+
+    hits = []
     for chunk, document, distance in rows:
-        dist = float(distance)
-        hits.append(
-            RetrievalHit(
-                chunk_id=chunk.id,
-                document_id=chunk.document_id,
-                chunk_index=chunk.chunk_index,
-                source_id=document.source_id,
-                source_name=document.source_name,
-                title=document.title,
-                region=document.region,
-                year=document.year,
-                url=document.url,
-                file_path=document.file_path,
-                section_title=chunk.section_title,
-                chunk_text=chunk.chunk_text,
-                char_count=chunk.char_count,
-                distance=dist,
-                score=score_from_distance(dist),
-                retrieval_source=[retrieval_source],
-            )
-        )
+        hits.append(_hit_from_row(chunk, document, float(distance), retrieval_source))
     return hits
 
 def merge_and_rerank_hits(
@@ -586,6 +699,9 @@ def retrieve(
     document_id: int | None = None,
     source_id: str | None = None,
     region: str | None = None,
+    specialty: str | None = None,
+    nosology: str | None = None,
+    per_source_k: int | None = None,
     translate_mode: TranslateMode = TRANSLATE_MODE,  # type: ignore[assignment]
     translate_query_target_lang: str = TRANSLATE_QUERY_TARGET_LANG,
     translate_hits_target_lang: str = TRANSLATE_TARGET_LANG,
@@ -638,6 +754,9 @@ def retrieve(
             document_id=document_id,
             source_id=source_id,
             region=region,
+            specialty=specialty,
+            nosology=nosology,
+            per_source_k=per_source_k,
         )
 
         if translator is not None:
@@ -665,6 +784,9 @@ def retrieve(
                 document_id=document_id,
                 source_id=source_id,
                 region=region,
+                specialty=specialty,
+                nosology=nosology,
+                per_source_k=per_source_k,
             )
 
         hits = merge_and_rerank_hits(
@@ -701,6 +823,9 @@ def retrieve(
             document_id=document_id,
             source_id=source_id,
             region=region,
+            specialty=specialty,
+            nosology=nosology,
+            per_source_k=per_source_k,
         )
 
         hits = merge_and_rerank_hits(
