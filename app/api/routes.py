@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import distinct, select
+from sqlalchemy import distinct, func, select
 
 from app.db import session_scope
 from app.models import Chunk, Document
@@ -31,6 +31,8 @@ class SourceItemResponse(BaseModel):
     year: int | None = None
     url: str | None = None
     chunk_count: int = 0
+    missing_embeddings: int = 0
+    enriched_chunks: int = 0
     specialty: str | None = None
     nosology_primary: str | None = None
     has_summary: bool = False
@@ -105,8 +107,29 @@ def list_sources() -> SourcesResponse:
             )
         )
 
+        # Fetch per-document chunk stats in bulk
+        # func.count(col) counts non-NULL values
+        stats_rows = session.execute(
+            select(
+                Chunk.document_id,
+                func.count(Chunk.id).label("total"),
+                func.count(Chunk.embedding).label("embedded"),
+                func.count(Chunk.summary).label("enriched"),
+            ).group_by(Chunk.document_id)
+        ).mappings().all()
+
+        stats: dict[int, dict] = {
+            r["document_id"]: {
+                "total": int(r["total"] or 0),
+                "missing_emb": int(r["total"] or 0) - int(r["embedded"] or 0),
+                "enriched": int(r["enriched"] or 0),
+            }
+            for r in stats_rows
+        }
+
         items: list[SourceItemResponse] = []
         for doc in documents:
+            s = stats.get(doc.id, {"total": 0, "missing_emb": 0, "enriched": 0})
             items.append(
                 SourceItemResponse(
                     document_id=doc.id,
@@ -116,7 +139,9 @@ def list_sources() -> SourcesResponse:
                     region=doc.region,
                     year=doc.year,
                     url=doc.url,
-                    chunk_count=len(doc.chunks),
+                    chunk_count=s["total"],
+                    missing_embeddings=s["missing_emb"],
+                    enriched_chunks=s["enriched"],
                     specialty=getattr(doc, "specialty", None),
                     nosology_primary=getattr(doc, "nosology_primary", None),
                     has_summary=bool(getattr(doc, "summary_ru", None)),
