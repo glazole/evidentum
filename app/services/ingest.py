@@ -54,29 +54,71 @@ KR_CANONICAL_SECTION_TITLES = [
     "7. Дополнительная информация (в том числе факторы, влияющие на исход заболевания или состояния)",
 ]
 
+def normalize_kr_title_for_match(text: str) -> str:
+    text = normalize_whitespace(text)
+    text = text.replace("ё", "е").replace("Ё", "Е")
+    text = text.replace("̆", "")
+    text = text.replace("–", "-").replace("—", "-")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+KR_CANONICAL_SECTION_MAP = {
+    normalize_kr_title_for_match(title): title
+    for title in KR_CANONICAL_SECTION_TITLES
+}
+
 
 def is_likely_section_header(line: str, prev_line: Optional[str] = None) -> bool:
-    """Эвристическое определение строки как заголовка раздела."""
-    line = line.strip()
-    if not line or len(line) > 200:
+    """Более строгая эвристика определения заголовка раздела."""
+    line = normalize_whitespace(line)
+    if not line:
         return False
 
-    # Паттерны нумерации (русские и английские)
-    # "1.", "1.1", "1.1.1", "1)", "1.1)", "Глава 1.", "Chapter 1.", "Section 1."
-    if re.match(r'^(\d+([.-]?\d+)*|(Глава|Раздел|Chapter|Section|Part)\s+)\s*[\.\)]?\s*\d+', line, re.IGNORECASE):
-        # Должно быть хотя бы ещё слово после номера
-        if len(line.split()) > 1:
-            return True
+    if len(line) > 180:
+        return False
 
-    # Короткие строки в верхнем регистре (например, "СПИСОК ЛИТЕРАТУРЫ", "REFERENCES")
-    if line.isupper() and len(line) > 4 and len(line.split()) >= 2:
+    low = line.lower()
+
+    # Явный шум / куски таблиц / ссылок / уровни доказательности
+    noise_patterns = [
+        r"\b95% ci\b",
+        r"\bhr\b",
+        r"\bp\s*[=<]",
+        r"\bnct\d+\b",
+        r"\bet al\b",
+        r"\[\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*\]",
+        r"^\d+[\d\s.,;%–\-]*$",
+        r"^(еок|уур|удд)\b",
+        r"^\d+(?:[–\-]\d+)?\s*,\s*\d+$",
+        r"^\d+%.*$",
+    ]
+    if any(re.search(pattern, low, flags=re.IGNORECASE) for pattern in noise_patterns):
+        return False
+
+    # Канонические верхнеуровневые русские разделы
+    if KR_TOP_LEVEL_HEADING_RE.match(line):
         return True
 
-    # Строки, начинающиеся с заглавной, не слишком длинные, и предыдущая строка пустая
-    if prev_line and not prev_line.strip() and line[0].isupper() and len(line) < 100:
-        # Исключаем явно не-заголовки (например, "Иванов И.И., ...")
-        if not re.match(r'^[А-ЯA-Z][а-яa-z]+,', line):
-            return True
+    normalized = normalize_kr_title_for_match(line)
+    if normalized in KR_CANONICAL_SECTION_MAP:
+        return True
+
+    # Английские / общие явные заголовки
+    if re.match(r"^(chapter|section|part)\b", low):
+        return True
+    if re.match(r"^(глава|раздел|часть)\b", low):
+        return True
+
+    # Короткие UPPERCASE заголовки
+    if line.isupper() and 4 <= len(line) <= 80 and 1 <= len(line.split()) <= 10:
+        return True
+
+    # Осторожная эвристика по пустой строке сверху
+    # Только если строка не слишком длинная, без явных цифро-табличных паттернов
+    if prev_line is not None and not prev_line.strip():
+        if len(line) <= 90 and line[0].isupper():
+            if not re.search(r"\d{2,}", line) and len(line.split()) <= 12:
+                return True
 
     return False
 
@@ -171,27 +213,11 @@ def normalize_whitespace(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-def normalize_kr_title_for_match(text: str) -> str:
-    text = normalize_whitespace(text)
-    text = text.replace("ё", "е").replace("Ё", "Е")
-    text = text.replace("̆", "")
-    text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-KR_CANONICAL_SECTION_MAP = {
-    normalize_kr_title_for_match(title): title
-    for title in KR_CANONICAL_SECTION_TITLES
-}
-
-
 def normalize_heading_text(text: str) -> str:
     text = normalize_whitespace(text)
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text[:512]
-
-
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
