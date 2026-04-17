@@ -142,6 +142,16 @@ def _api_trigger(document_id: int, stage: str) -> dict[str, Any]:
     return r.json()
 
 
+def _api_delete_document(document_id: int) -> dict[str, Any]:
+    """DELETE /api/documents/{id}."""
+    r = requests.delete(
+        f"{API_BASE_URL}/documents/{document_id}",
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def render_status() -> None:
     """Render indexing status with per-document progress bars and trigger buttons."""
     items = load_sources()
@@ -199,8 +209,11 @@ def render_status() -> None:
             icon = "🟢"
 
         with st.container():
-            # Header row: icon + name + source_id
-            hdr, btn_col = st.columns([6, 2])
+            trigger_key = f"trig_{doc_id}"
+            confirm_key = f"confirm_del_{doc_id}"
+
+            # Header row: icon + name + source_id + delete button
+            hdr, btn_col, del_col = st.columns([5, 2, 1])
             hdr.markdown(
                 f"{icon} **{name}**  "
                 f"<span style='color:#888; font-size:0.78rem'>&nbsp;{source_id_val}"
@@ -211,7 +224,6 @@ def render_status() -> None:
             # Action buttons (inline, right-aligned)
             with btn_col:
                 b1, b2, b3 = st.columns(3)
-                trigger_key = f"trig_{doc_id}"
 
                 if b1.button(
                     "▶ Embed",
@@ -251,6 +263,36 @@ def render_status() -> None:
                         st.cache_data.clear()
                     except Exception as e:
                         st.session_state[trigger_key] = f"Ошибка: {e}"
+
+            # Delete button — one click to arm, second click to confirm
+            with del_col:
+                if not st.session_state.get(confirm_key):
+                    if st.button(
+                        "🗑️",
+                        key=f"del_arm_{doc_id}",
+                        help="Удалить документ из системы",
+                        width="stretch",
+                    ):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    # Confirmation state: show Confirm / Cancel
+                    st.caption("⚠️ Удалить?")
+                    cc1, cc2 = st.columns(2)
+                    if cc1.button("✅", key=f"del_yes_{doc_id}", help="Подтвердить удаление", width="stretch"):
+                        try:
+                            resp = _api_delete_document(doc_id)
+                            st.session_state.pop(confirm_key, None)
+                            st.session_state.pop(trigger_key, None)
+                            st.success(resp.get("message", "Удалено"))
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.session_state[trigger_key] = f"Ошибка удаления: {e}"
+                            st.session_state.pop(confirm_key, None)
+                    if cc2.button("❌", key=f"del_no_{doc_id}", help="Отмена", width="stretch"):
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
 
             # Show last trigger message if any
             if st.session_state.get(trigger_key):

@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import distinct, func, select
 
 DATA_RAW_DIR = Path("/app/data/raw")
@@ -635,6 +636,71 @@ def trigger_title(document_id: int, background_tasks: BackgroundTasks) -> Trigge
         stage="title",
         status="started",
         message="Генерация названия запущена в фоне. Обновите статус через ~15 сек.",
+    )
+
+
+class DeleteDocumentResponse(BaseModel):
+    document_id: int
+    source_id: str
+    chunks_deleted: int
+    file_deleted: bool
+    message: str
+
+
+@router.delete("/documents/{document_id}", response_model=DeleteDocumentResponse)
+def delete_document(document_id: int) -> DeleteDocumentResponse:
+    """
+    Delete a document and all its chunks from the database.
+    Also removes the source file from data/raw/ if it exists.
+    """
+    import sys as _sys
+
+    with session_scope() as session:
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+
+        source_id = doc.source_id
+        file_path = doc.file_path
+
+        # Count chunks before deletion
+        chunk_count = session.scalar(
+            select(func.count(Chunk.id)).where(Chunk.document_id == document_id)
+        ) or 0
+
+        # Delete chunks first (FK constraint)
+        session.execute(sa_delete(Chunk).where(Chunk.document_id == document_id))
+        session.delete(doc)
+
+    # Try to remove source file from disk
+    file_deleted = False
+    if file_path:
+        fp = Path(file_path)
+        if not fp.is_absolute():
+            fp = Path("/app") / fp
+        try:
+            if fp.exists():
+                fp.unlink()
+                file_deleted = True
+                print(f"[delete] removed file {fp}", file=_sys.stderr)
+        except Exception as exc:
+            print(f"[delete] could not remove file {fp}: {exc}", file=_sys.stderr)
+
+    print(
+        f"[delete] doc {document_id} ({source_id}): {chunk_count} chunks deleted, "
+        f"file_deleted={file_deleted}",
+        file=_sys.stderr,
+    )
+
+    return DeleteDocumentResponse(
+        document_id=document_id,
+        source_id=source_id,
+        chunks_deleted=chunk_count,
+        file_deleted=file_deleted,
+        message=(
+            f"Документ «{source_id}» удалён: {chunk_count} фрагментов, "
+            f"файл {'удалён' if file_deleted else 'не найден или уже удалён'}."
+        ),
     )
 
 
