@@ -125,6 +125,9 @@ def render_status() -> None:
         return
 
     any_issues = False
+    any_missing_emb = False
+    any_not_enriched = False
+
     cols = st.columns(max(len(items), 1))
     for col, item in zip(cols, items):
         total = item.get("chunk_count", 0)
@@ -138,11 +141,13 @@ def render_status() -> None:
             status_val = f"{embedded}/{total}"
             label_suffix = "эмбеддингов"
             any_issues = True
+            any_missing_emb = True
         elif enriched < total:
             icon, delta_color = "🟡", "off"
             status_val = f"{enriched}/{total}"
             label_suffix = "обогащено"
             any_issues = True
+            any_not_enriched = True
         else:
             icon, delta_color = "🟢", "normal"
             status_val = str(total)
@@ -159,14 +164,21 @@ def render_status() -> None:
         )
 
     c1, c2 = st.columns([6, 1])
-    if any_issues:
-        c1.info(
-            "Индексация продолжается в фоне. "
-            "Поиск доступен, но некоторые документы ещё обрабатываются.",
-            icon="ℹ️",
+    if any_missing_emb:
+        c1.error(
+            "🔴 Часть документов ещё не проиндексирована — поиск по ним недоступен. "
+            "Индексация выполняется в фоне, обновите статус через несколько минут.",
+            icon="🔴",
+        )
+    elif any_not_enriched:
+        c1.warning(
+            "🟡 Обогащение фрагментов ещё не завершено. "
+            "Поиск работает, но **качество ответов и сравнений ниже**: "
+            "система использует сырой текст вместо LLM-дистиллята (summary). "
+            "Обогащение выполняется автоматически в фоне.",
         )
     else:
-        c1.success("Все документы полностью проиндексированы.", icon="✅")
+        c1.success("Все документы полностью проиндексированы и обогащены.", icon="✅")
 
     if c2.button("↻ Обновить", use_container_width=True):
         st.cache_data.clear()
