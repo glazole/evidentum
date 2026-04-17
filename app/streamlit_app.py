@@ -136,71 +136,151 @@ def display_name(item: dict) -> str:
 
 # ── Status section ────────────────────────────────────────────────────────────
 
+def _api_trigger(document_id: int, stage: str) -> dict[str, Any]:
+    """POST /api/documents/{id}/{stage} and return response dict."""
+    r = requests.post(
+        f"{API_BASE_URL}/documents/{document_id}/{stage}",
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def render_status() -> None:
-    """Render indexing status as a compact list inside an expander at page bottom."""
+    """Render indexing status with per-document progress bars and trigger buttons."""
     items = load_sources()
     if not items:
         st.warning("Не удалось загрузить список источников. API недоступен?")
         return
 
-    any_missing_emb = False
-    any_not_enriched = False
+    any_missing_emb = any(i.get("missing_embeddings", 0) > 0 for i in items)
+    any_not_enriched = any(
+        i.get("enriched_chunks", 0) < i.get("chunk_count", 0)
+        and i.get("missing_embeddings", 0) == 0
+        for i in items
+    )
 
     # Summary banner
-    for item in items:
-        total = item.get("chunk_count", 0)
-        missing_emb = item.get("missing_embeddings", 0)
-        enriched = item.get("enriched_chunks", 0)
-        if missing_emb > 0:
-            any_missing_emb = True
-        elif enriched < total:
-            any_not_enriched = True
-
-    c1, c2 = st.columns([7, 1])
-    if any_missing_emb:
-        c1.error(
-            "🔴 Часть документов ещё не проиндексирована — поиск по ним недоступен. "
-            "Индексация выполняется в фоне, обновите статус через несколько минут.",
-            icon="🔴",
-        )
-    elif any_not_enriched:
-        c1.warning(
-            "🟡 Обогащение не завершено. Поиск работает, но **качество ответов ниже**: "
-            "система использует сырой текст вместо LLM-дистиллята. "
-            "Обогащение выполняется в фоне автоматически.",
-        )
-    else:
-        c1.success("Все документы полностью проиндексированы и обогащены.", icon="✅")
-    if c2.button("↻ Обновить", use_container_width=True):
+    banner_col, refresh_col = st.columns([8, 1])
+    with banner_col:
+        if any_missing_emb:
+            st.error(
+                "🔴 Часть документов ещё не проиндексирована — поиск по ним недоступен. "
+                "Запустите этап **Эмбеддинги** вручную или дождитесь фонового процесса.",
+            )
+        elif any_not_enriched:
+            st.warning(
+                "🟡 Обогащение не завершено. Поиск работает, но **качество ответов ниже**: "
+                "система использует сырой текст вместо LLM-дистиллята.",
+            )
+        else:
+            st.success(f"✅ Все {len(items)} документов полностью проиндексированы и обогащены.")
+    if refresh_col.button("↻", help="Обновить статус", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     st.markdown("---")
 
-    # Document list
+    # Per-document rows
     for item in items:
-        total = item.get("chunk_count", 0)
-        missing_emb = item.get("missing_embeddings", 0)
-        enriched = item.get("enriched_chunks", 0)
-        embedded = total - missing_emb
+        doc_id: int = item.get("document_id", 0)
+        total: int = item.get("chunk_count", 0) or 1  # avoid /0
+        missing_emb: int = item.get("missing_embeddings", 0)
+        enriched: int = item.get("enriched_chunks", 0)
+        embedded: int = total - missing_emb
         name = display_name(item)
         source_id_val = item.get("source_id") or "—"
 
+        emb_pct   = embedded / total
+        enrich_pct = enriched / total
+
+        # Overall icon
         if missing_emb > 0:
             icon = "🔴"
-            status = f"эмбеддингов: {embedded}/{total}"
         elif enriched < total:
             icon = "🟡"
-            status = f"обогащено: {enriched}/{total} фрагментов"
         else:
             icon = "🟢"
-            status = f"{total} фрагментов"
 
-        st.markdown(
-            f"{icon} **{name}**  \n"
-            f"<span style='color:#888; font-size:0.8rem'>{source_id_val} · {status}</span>",
-            unsafe_allow_html=True,
-        )
+        with st.container():
+            # Header row: icon + name + source_id
+            hdr, btn_col = st.columns([6, 2])
+            hdr.markdown(
+                f"{icon} **{name}**  "
+                f"<span style='color:#888; font-size:0.78rem'>&nbsp;{source_id_val}"
+                f" · {total} фрагментов</span>",
+                unsafe_allow_html=True,
+            )
+
+            # Action buttons (inline, right-aligned)
+            with btn_col:
+                b1, b2, b3 = st.columns(3)
+                trigger_key = f"trig_{doc_id}"
+
+                if b1.button(
+                    "▶ Embed",
+                    key=f"embed_{doc_id}",
+                    help="Принудительно построить эмбеддинги для этого документа",
+                    use_container_width=True,
+                ):
+                    try:
+                        resp = _api_trigger(doc_id, "embed")
+                        st.session_state[trigger_key] = resp.get("message", "Запущено")
+                        st.cache_data.clear()
+                    except Exception as e:
+                        st.session_state[trigger_key] = f"Ошибка: {e}"
+
+                if b2.button(
+                    "▶ Enrich",
+                    key=f"enrich_{doc_id}",
+                    help="Принудительно запустить LLM-обогащение фрагментов",
+                    use_container_width=True,
+                ):
+                    try:
+                        resp = _api_trigger(doc_id, "enrich")
+                        st.session_state[trigger_key] = resp.get("message", "Запущено")
+                        st.cache_data.clear()
+                    except Exception as e:
+                        st.session_state[trigger_key] = f"Ошибка: {e}"
+
+                if b3.button(
+                    "▶ Title",
+                    key=f"title_{doc_id}",
+                    help="Перегенерировать читаемое название через LLM",
+                    use_container_width=True,
+                ):
+                    try:
+                        resp = _api_trigger(doc_id, "title")
+                        st.session_state[trigger_key] = resp.get("message", "Запущено")
+                        st.cache_data.clear()
+                    except Exception as e:
+                        st.session_state[trigger_key] = f"Ошибка: {e}"
+
+            # Show last trigger message if any
+            if st.session_state.get(trigger_key):
+                st.caption(f"ℹ️ {st.session_state[trigger_key]}")
+
+            # Progress bars
+            pb1, pb2, pb3 = st.columns(3)
+            with pb1:
+                st.caption("📥 Фрагменты (инgest)")
+                st.progress(1.0, text=f"{total}/{total}")
+            with pb2:
+                st.caption("🔢 Эмбеддинги")
+                st.progress(
+                    emb_pct,
+                    text=f"{embedded}/{total}"
+                    + (" ✅" if missing_emb == 0 else f" — {missing_emb} не готово"),
+                )
+            with pb3:
+                st.caption("✨ LLM-обогащение")
+                st.progress(
+                    enrich_pct,
+                    text=f"{enriched}/{total}"
+                    + (" ✅" if enriched >= total else f" — {total - enriched} не готово"),
+                )
+
+        st.markdown("<hr style='margin:6px 0; border-color:#e0e0e0'>", unsafe_allow_html=True)
 
 
 # ── Result renderers ──────────────────────────────────────────────────────────

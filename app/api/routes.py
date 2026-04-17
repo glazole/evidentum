@@ -391,6 +391,99 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
         raise HTTPException(status_code=500, detail=f"Compare failed: {exc}") from exc
 
 
+class TriggerResponse(BaseModel):
+    document_id: int
+    stage: str
+    status: str
+    message: str
+
+
+@router.post("/documents/{document_id}/embed", response_model=TriggerResponse)
+def trigger_embed(document_id: int, background_tasks: BackgroundTasks) -> TriggerResponse:
+    """Force-trigger embedding for a specific document (runs in background)."""
+    with session_scope() as session:
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+
+    def _embed() -> None:
+        from app.services.embedder import embed_chunks
+        try:
+            stats = embed_chunks(document_id=document_id)
+            print(f"[trigger] embed doc {document_id}: {stats}", file=__import__("sys").stderr)
+        except Exception as exc:
+            print(f"[trigger] embed error doc {document_id}: {exc}", file=__import__("sys").stderr)
+
+    background_tasks.add_task(_embed)
+    return TriggerResponse(
+        document_id=document_id,
+        stage="embed",
+        status="started",
+        message="Построение эмбеддингов запущено в фоне. Обновите статус через 30–60 сек.",
+    )
+
+
+@router.post("/documents/{document_id}/enrich", response_model=TriggerResponse)
+def trigger_enrich(document_id: int, background_tasks: BackgroundTasks) -> TriggerResponse:
+    """Force-trigger LLM enrichment for a specific document (runs in background)."""
+    with session_scope() as session:
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+
+    def _enrich() -> None:
+        from app.services.enricher import enrich_chunks
+        from app.services.embedder import embed_chunks
+        from app.services.llm import get_llm_client
+        try:
+            llm = get_llm_client()
+            stats = enrich_chunks(document_id, llm=llm)
+            print(f"[trigger] enrich doc {document_id}: {stats}", file=__import__("sys").stderr)
+            embed_chunks(document_id=document_id, only_missing=False)
+            print(f"[trigger] re-embed after enrich doc {document_id}", file=__import__("sys").stderr)
+        except Exception as exc:
+            print(f"[trigger] enrich error doc {document_id}: {exc}", file=__import__("sys").stderr)
+
+    background_tasks.add_task(_enrich)
+    return TriggerResponse(
+        document_id=document_id,
+        stage="enrich",
+        status="started",
+        message="LLM-обогащение запущено в фоне. Обновите статус через несколько минут.",
+    )
+
+
+@router.post("/documents/{document_id}/title", response_model=TriggerResponse)
+def trigger_title(document_id: int, background_tasks: BackgroundTasks) -> TriggerResponse:
+    """Force-regenerate the display title for a document (runs in background)."""
+    with session_scope() as session:
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+
+    def _title() -> None:
+        from app.services.autoprocess import _generate_title
+        try:
+            # Temporarily bypass boring-title guard so user can force regeneration
+            from app.db import session_scope as _ss
+            from app.models import Document as _Doc
+            with _ss() as s:
+                d = s.get(_Doc, document_id)
+                if d:
+                    d.source_name = d.source_id  # reset to slug so _generate_title runs
+            _generate_title(document_id)
+        except Exception as exc:
+            print(f"[trigger] title error doc {document_id}: {exc}", file=__import__("sys").stderr)
+
+    background_tasks.add_task(_title)
+    return TriggerResponse(
+        document_id=document_id,
+        stage="title",
+        status="started",
+        message="Генерация названия запущена в фоне. Обновите статус через ~15 сек.",
+    )
+
+
 @router.get("/documents/{document_id}/summary", response_model=DocumentSummaryResponse)
 def get_document_summary(document_id: int) -> DocumentSummaryResponse:
     with session_scope() as session:
