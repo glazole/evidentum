@@ -468,8 +468,6 @@ def render_compare_result(data: dict) -> None:
 
     st.caption("_Информация носит справочный характер и не заменяет врачебное решение._")
 
-    render_feedback_buttons(log_id, "compare")
-
 
 # ── Main layout ───────────────────────────────────────────────────────────────
 
