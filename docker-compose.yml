@@ -87,8 +87,13 @@ services:
     volumes:
       - ./:/app
     working_dir: /app
-    command: >
-      sh -c "python -m app.ui"
+    command: >-
+      streamlit run app/streamlit_app.py
+      --server.port 7860
+      --server.address 0.0.0.0
+      --server.headless true
+      --server.fileWatcherType none
+      --browser.gatherUsageStats false
     ports:
       - "127.0.0.1:7860:7860"
     networks:

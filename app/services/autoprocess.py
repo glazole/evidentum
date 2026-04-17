@@ -14,11 +14,17 @@ def _fmt_source_id(source_id: str) -> str:
 
 def _is_boring_title(title: str | None) -> bool:
     """Return True if the title extracted from PDF is uninformative."""
+    import re as _re
     if not title:
         return True
     t = title.strip().lower()
-    boring = {"оглавление", "содержание", "circulation", "untitled", "title"}
-    return t in boring or len(t) < 6
+    boring_exact = {"оглавление", "содержание", "circulation", "untitled", "title"}
+    if t in boring_exact or len(t) < 6:
+        return True
+    # File slugs / source_id-like strings: no spaces, only alphanumeric + hyphens/underscores/dots
+    if _re.fullmatch(r"[a-z0-9а-яёa-z\-_\.]+", t):
+        return True
+    return False
 
 
 def _generate_title(document_id: int) -> None:

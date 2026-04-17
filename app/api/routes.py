@@ -72,6 +72,8 @@ class AnswerRequest(BaseModel):
     specialty: str | None = None
     nosology: str | None = None
     per_source_k: int | None = None
+    source_id: str | None = None
+    document_id: int | None = None
 
 
 class CompareRequest(BaseModel):
@@ -218,6 +220,7 @@ def answer_route(payload: AnswerRequest) -> dict[str, Any]:
             specialty=payload.specialty,
             nosology=payload.nosology,
             per_source_k=payload.per_source_k,
+            source_id=payload.source_id,
         )
         return format_for_ui(result)
     except Exception as exc:
@@ -283,23 +286,46 @@ def compare_route(payload: CompareRequest) -> dict[str, Any]:
             temperature=payload.temperature,
         )
 
+        # Build source_labels the same way synthesize_structured does
+        def _source_label(hit: Any) -> str:
+            return (
+                getattr(hit, "source_name", None)
+                or getattr(hit, "title", None)
+                or getattr(hit, "source_id", None)
+                or "—"
+            )
+
         source_rows = []
         for source_id, source_hits in relevant_sources.items():
             first = source_hits[0]
             best_score = max(h.score for h in source_hits)
+            label = _source_label(first)
             text_combined = "\n---\n".join(
                 (h.translated_chunk_text or h.chunk_text or "").strip()[:600]
                 for h in source_hits
             )
+            fragments = [
+                {
+                    "index": i + 1,
+                    "section_title": getattr(h, "section_title", None),
+                    "summary": getattr(h, "summary", None),
+                    "text": (h.translated_chunk_text or h.chunk_text or "").strip()[:800],
+                    "score": round(h.score, 3),
+                    "evidence_level": getattr(h, "evidence_level", None),
+                }
+                for i, h in enumerate(source_hits)
+            ]
             source_rows.append({
                 "source_id": source_id,
                 "source_name": first.source_name,
+                "label": label,
                 "title": first.title,
                 "region": first.region,
                 "year": first.year,
                 "url": first.url,
                 "chunk_count": len(source_hits),
                 "combined_text": text_combined,
+                "fragments": fragments,
                 "score": round(best_score, 3),
             })
 
@@ -310,10 +336,10 @@ def compare_route(payload: CompareRequest) -> dict[str, Any]:
             "question": payload.question,
             "effective_query": retrieval.effective_query,
             "sources": source_rows,
+            "positions": structured.get("positions") or [],
             "consensus": structured.get("consensus"),
             "disagreements": structured.get("disagreements") or [],
             "recommendation": structured.get("recommendation"),
-            "citations": structured.get("citations") or [],
         }
 
     except Exception as exc:

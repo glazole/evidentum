@@ -39,6 +39,7 @@ MODEL_ALIASES = {
 class SourceItem:
     index: int
     source_id: str | None
+    source_name: str | None  # human-readable document name (from Document.source_name)
     title: str | None
     section_title: str | None
     url: str | None
@@ -166,13 +167,14 @@ class YandexOpenAIAnswerer:
             "Сохраняй латинские МНН-названия препаратов. "
             "Используй ТОЛЬКО информацию из предоставленных фрагментов. "
             "Если данных мало — скажи явно.\n\n"
-            "ВАЖНО: в поле 'sources' у disagreements и citations пиши ПОЛНОЕ НАЗВАНИЕ гайдлайна "
-            "(например 'ESC 2024' или 'КР МЗ РФ 2024'), НЕ номера фрагментов.\n\n"
+            "ВАЖНО: во всех полях используй ПОЛНОЕ НАЗВАНИЕ гайдлайна из заголовка "
+            "'=== ГАЙДЛАЙН: ... ===' — НЕ номера фрагментов.\n\n"
             "Верни строгий JSON без маркдаун-разметки:\n"
-            '{"consensus": "...", '
-            '"disagreements": [{"sources": ["Название гайдлайна"], "text": "В чём расхождение"}], '
-            '"recommendation": "...", '
-            '"citations": [{"idx": 1, "source_name": "Название гайдлайна", "section": "...", "url": "..."}]}'
+            '{"positions": [{"source": "Точное название гайдлайна из заголовка", '
+            '"text": "2-4 предложения: позиция этого гайдлайна по заданному вопросу"}], '
+            '"consensus": "Что рекомендуют все или большинство гайдлайнов, или null если консенсуса нет", '
+            '"disagreements": [{"sources": ["Название 1", "Название 2"], "text": "Суть расхождения"}], '
+            '"recommendation": "Итоговая практическая рекомендация для врача (2-4 предложения)"}'
         )
 
         # Group context by guideline (source_id), build name map
@@ -182,7 +184,8 @@ class YandexOpenAIAnswerer:
             key = src.source_id or "unknown"
             grouped.setdefault(key, []).append(src)
             if key not in source_labels:
-                source_labels[key] = src.title or src.source_id or key
+                # Prefer human-readable source_name over PDF title
+                source_labels[key] = src.source_name or src.title or src.source_id or key
 
         # Preamble: explicit mapping so LLM knows names
         name_map_lines = [
@@ -284,6 +287,7 @@ def _normalize_sources(hits: Iterable[Any]) -> list[SourceItem]:
             SourceItem(
                 index=i,
                 source_id=_safe_get(hit, "source_id"),
+                source_name=_safe_get(hit, "source_name"),
                 title=_safe_get(hit, "title"),
                 section_title=_safe_get(hit, "section_title"),
                 url=_safe_get(hit, "url"),
@@ -353,6 +357,8 @@ def answer_question(
     per_source_k: int | None = None,
     specialty: str | None = None,
     nosology: str | None = None,
+    source_id: str | None = None,
+    document_id: int | None = None,
 ) -> AnswerResult:
     if retrieve is None:
         raise RuntimeError("app.services.retriever.retrieve is unavailable.")
@@ -364,6 +370,8 @@ def answer_question(
         per_source_k=per_source_k,
         specialty=specialty,
         nosology=nosology,
+        source_id=source_id,
+        document_id=document_id,
     )
 
     hits = _safe_get(retrieval_result, "hits", []) or []
