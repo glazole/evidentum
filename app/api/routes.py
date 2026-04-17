@@ -86,10 +86,135 @@ class CompareRequest(BaseModel):
     translate_mode: TranslateMode = "dual_query"
     model: str = "alice"
     temperature: float = Field(default=0.2, ge=0.0, le=1.5)
-    min_score: float = Field(default=0.35, ge=0.0, le=1.0)
+    min_score: float = Field(default=0.45, ge=0.0, le=1.0)
     max_chunks_per_source: int = Field(default=3, ge=1, le=6)
     specialty: str | None = None
     nosology: str | None = None
+    nosology_filter: bool = Field(
+        default=True,
+        description=(
+            "If True, filter out sources whose enriched chunks have nosology/specialty "
+            "metadata that has no word overlap with the question. "
+            "Sources with score >= nosology_bypass_score are always kept. "
+            "Sources without enough enrichment data are also always kept."
+        ),
+    )
+    nosology_bypass_score: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        description="Sources with best chunk score >= this value bypass nosology filter.",
+    )
+
+
+# ── Nosology/specialty metadata filter ─────────────────────────────────────────
+
+# Common Russian medical abbreviations → expanded form
+_MEDICAL_ABBREVS: dict[str, str] = {
+    "ба": "астма",
+    "фп": "фибрилляция",
+    "аг": "гипертония гипертензия",
+    "хсн": "сердечная недостаточность",
+    "хобл": "обструктивная лёгочная",
+    "ибс": "ишемическая болезнь",
+    "им": "инфаркт",
+    "сд": "диабет",
+    "хбп": "почечная болезнь",
+    "дм": "диабет",
+    "гкмп": "кардиомиопатия",
+    "тэла": "эмболия",
+    "чсс": "ритм",
+    "инсульт": "инсульт цереброваскулярный",
+    "бронхит": "бронхит лёгочный",
+    "пнп": "нейропатия",
+    "рак": "онкология опухоль",
+    "рж": "желудок",
+    "ркт": "колоректальный",
+}
+
+_STOP_WORDS: frozenset[str] = frozenset({
+    "ли", "не", "и", "в", "с", "у", "по", "на", "при", "для", "к", "от",
+    "что", "как", "надо", "нужно", "да", "нет", "это", "или", "но", "же",
+    "был", "была", "быть", "есть", "чтобы", "если", "когда", "где",
+    "который", "которые", "которого", "которой", "продолжать", "продолжение",
+    "можно", "нельзя", "необходимо", "следует", "рекомендуется",
+})
+
+
+def _tokenize_medical(text: str) -> set[str]:
+    """Tokenize medical text, expand abbreviations, strip ICD-10 codes."""
+    import re as _re
+    raw = {w.lower() for w in _re.findall(r"[а-яёa-z]+", text, _re.IGNORECASE)}
+    # Drop stopwords and very short tokens
+    raw = {w for w in raw if len(w) >= 3 and w not in _STOP_WORDS}
+    # Strip ICD-10 codes like J45, I48, C34 (letter+digits)
+    raw = {w for w in raw if not _re.fullmatch(r"[a-z]\d{1,2}", w, _re.I)}
+    # Expand abbreviations
+    expanded: set[str] = set(raw)
+    for token in raw:
+        if token in _MEDICAL_ABBREVS:
+            for exp in _MEDICAL_ABBREVS[token].split():
+                expanded.add(exp.lower())
+    return expanded
+
+
+def _nosology_matches_question(nosology: str, question_terms: set[str]) -> bool:
+    """True if any significant nosology term appears in the question terms."""
+    return bool(_tokenize_medical(nosology) & question_terms)
+
+
+def _apply_nosology_filter(
+    relevant_sources: dict[str, list],
+    question: str,
+    bypass_score: float,
+) -> dict[str, list]:
+    """
+    Secondary filter after score-based filtering.
+
+    Rules (all must fail to exclude a source):
+    1. best_score >= bypass_score  → always keep (high-confidence hit)
+    2. enrichment_ratio < 0.5     → keep (not enough metadata to decide)
+    3. ANY nosology/specialty in chunks overlaps with question → keep
+    4. Otherwise → exclude
+    """
+    import sys as _sys
+    question_terms = _tokenize_medical(question)
+    kept: dict[str, list] = {}
+
+    for src_id, src_hits in relevant_sources.items():
+        best_score = max(h.score for h in src_hits)
+
+        # Rule 1: bypass
+        if best_score >= bypass_score:
+            kept[src_id] = src_hits
+            continue
+
+        # Rule 2: insufficient enrichment
+        meta_fields = [
+            (getattr(h, "nosology", None) or "") + " " + (getattr(h, "specialty", None) or "")
+            for h in src_hits
+        ]
+        enriched_count = sum(1 for m in meta_fields if m.strip())
+        if enriched_count / len(src_hits) < 0.5:
+            kept[src_id] = src_hits
+            continue
+
+        # Rule 3: metadata overlap
+        combined_meta = " ".join(m for m in meta_fields if m.strip())
+        if _nosology_matches_question(combined_meta, question_terms):
+            kept[src_id] = src_hits
+        else:
+            # Report what was filtered
+            label = getattr(src_hits[0], "source_name", src_id)
+            nosologies = list({getattr(h, "nosology", "") for h in src_hits if getattr(h, "nosology", None)})
+            print(
+                f"[nosology_filter] EXCLUDED '{label}' (score={best_score:.2f}) "
+                f"nosologies={nosologies} | q_terms={sorted(question_terms)[:8]}",
+                file=_sys.stderr,
+            )
+
+    # Safety: never return empty (fall back to unfiltered)
+    return kept if kept else relevant_sources
 
 
 class DocumentSummaryResponse(BaseModel):
@@ -286,6 +411,14 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
             for src_id, src_hits in by_source.items()
             if max(h.score for h in src_hits) >= payload.min_score
         }
+
+        # Secondary nosology/specialty metadata filter
+        if payload.nosology_filter and relevant_sources:
+            relevant_sources = _apply_nosology_filter(
+                relevant_sources,
+                payload.question,
+                payload.nosology_bypass_score,
+            )
 
         if not relevant_sources:
             return {

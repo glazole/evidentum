@@ -96,6 +96,8 @@ def api_compare(
     translate_mode: str,
     model: str,
     temperature: float,
+    min_score: float = 0.45,
+    nosology_filter: bool = True,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "question": question,
@@ -103,6 +105,8 @@ def api_compare(
         "translate_mode": translate_mode,
         "model": model,
         "temperature": temperature,
+        "min_score": min_score,
+        "nosology_filter": nosology_filter,
     }
     r = requests.post(f"{API_BASE_URL}/compare", json=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
@@ -569,6 +573,28 @@ with left:
             ),
         )
 
+    if mode == "Сравнение гайдлайнов":
+        col_ms, col_nf = st.columns(2)
+        with col_ms:
+            min_score = st.slider(
+                "Мин. релевантность",
+                0.3, 0.9, 0.55, step=0.05,
+                help="Источники с лучшим score ниже порога исключаются из сравнения",
+            )
+        with col_nf:
+            nosology_filter = st.checkbox(
+                "Фильтр по нозологии",
+                value=True,
+                help=(
+                    "Исключать источники, чьи LLM-обогащённые фрагменты "
+                    "содержат нозологию/специальность, не пересекающуюся с темой вопроса. "
+                    "Работает только для обогащённых документов."
+                ),
+            )
+    else:
+        min_score = 0.55
+        nosology_filter = False
+
     search_btn = st.button("🔍 Найти", type="primary", width="stretch")
 
 # ── Results panel ─────────────────────────────────────────────────────────────
@@ -598,6 +624,8 @@ with right:
                             translate_mode=translate_mode,
                             model=model,
                             temperature=temperature,
+                            min_score=min_score,
+                            nosology_filter=nosology_filter,
                         )
                         st.session_state["result"] = ("compare", data)
                     st.session_state["elapsed"] = time.time() - t0
