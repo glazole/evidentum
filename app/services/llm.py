@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
 
 from openai import OpenAI
@@ -43,6 +44,9 @@ class YandexLLMClient:
         model_family: str = LLM_MODEL_FAMILY,
         temperature: float = LLM_TEMPERATURE,
         max_tokens: int = LLM_MAX_TOKENS,
+        timeout: float = 60.0,
+        max_retries: int = 3,
+        retry_base_delay: float = 2.0,
         debug: bool = False,
     ) -> None:
         if not folder_id:
@@ -54,9 +58,16 @@ class YandexLLMClient:
         self.model_family = model_family
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
         self.debug = debug
 
-        self._client = OpenAI(base_url=base_url.rstrip("/"), api_key=api_key)
+        self._client = OpenAI(
+            base_url=base_url.rstrip("/"),
+            api_key=api_key,
+            timeout=timeout,
+        )
 
     def _model_uri(self, model_family: str | None = None) -> str:
         family = (model_family or self.model_family).strip().lower()
@@ -71,17 +82,29 @@ class YandexLLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
-        """Call YandexGPT and return the assistant's text."""
-        response = self._client.chat.completions.create(
-            model=self._model_uri(model_family),
-            temperature=temperature if temperature is not None else self.temperature,
-            max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
-            messages=messages,  # type: ignore[arg-type]
-        )
-        text = response.choices[0].message.content or ""
-        if self.debug:
-            print("LLM response:", text[:300])
-        return text.strip()
+        """Call YandexGPT with retry on transient errors, return assistant text."""
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._model_uri(model_family),
+                    temperature=temperature if temperature is not None else self.temperature,
+                    max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
+                    messages=messages,  # type: ignore[arg-type]
+                )
+                text = response.choices[0].message.content or ""
+                if self.debug:
+                    print("LLM response:", text[:300])
+                return text.strip()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.max_retries:
+                    break
+                delay = self.retry_base_delay * (2 ** (attempt - 1))
+                if self.debug:
+                    print(f"LLM attempt {attempt} failed: {exc}. Retrying in {delay}s…")
+                time.sleep(delay)
+        raise RuntimeError(f"YandexLLM failed after {self.max_retries} attempts: {last_exc}") from last_exc
 
     def complete_json(
         self,

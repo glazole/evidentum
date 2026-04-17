@@ -122,6 +122,9 @@ def enrich_chunks(
                 except Exception as exc:
                     stats.errors += 1
                     print(f"[enrich] {idx}/{total} chunk_id={chunk.id} ERROR: {exc}", flush=True)
+                    # Mark as attempted so this chunk is not retried forever on next run.
+                    # Empty string is falsy → LLM synthesis skips it gracefully.
+                    chunk.summary = ""
 
         # commit happens on session_scope exit; sleep outside the transaction
         if start + batch_size < total:
