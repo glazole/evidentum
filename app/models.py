@@ -122,3 +122,42 @@ class Chunk(Base):
 
     def __repr__(self) -> str:
         return f"Chunk(id={self.id}, document_id={self.document_id}, chunk_index={self.chunk_index})"
+
+
+class QueryLog(Base):
+    """Stores every search request with LLM-judge scores and user feedback."""
+
+    __tablename__ = "query_logs"
+    __table_args__ = (
+        Index("ix_query_logs_created_at", "created_at"),
+        Index("ix_query_logs_mode", "mode"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="answer")
+    answer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Truncated context sent to LLM-judge (max ~4000 chars)
+    context_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    elapsed_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # LLM-judge scores (filled asynchronously after the answer is returned)
+    score_faithfulness: Mapped[Optional[float]] = mapped_column(nullable=True)
+    score_relevance: Mapped[Optional[float]] = mapped_column(nullable=True)
+    score_completeness: Mapped[Optional[float]] = mapped_column(nullable=True)
+    score_consistency: Mapped[Optional[float]] = mapped_column(nullable=True)
+    judge_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # User explicit feedback: 1 = 👍, -1 = 👎, None = not rated
+    user_feedback: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"QueryLog(id={self.id}, mode={self.mode!r}, feedback={self.user_feedback})"

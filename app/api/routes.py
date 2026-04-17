@@ -210,7 +210,9 @@ def retrieve_route(payload: RetrieveRequest) -> dict[str, Any]:
 
 
 @router.post("/answer")
-def answer_route(payload: AnswerRequest) -> dict[str, Any]:
+def answer_route(payload: AnswerRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    import time as _time
+    t0 = _time.time()
     try:
         result = answer_question(
             payload.question,
@@ -226,17 +228,38 @@ def answer_route(payload: AnswerRequest) -> dict[str, Any]:
             per_source_k=payload.per_source_k,
             source_id=payload.source_id,
         )
-        return format_for_ui(result)
+        ui_data = format_for_ui(result)
+        elapsed_ms = int((_time.time() - t0) * 1000)
+
+        # Build context text for LLM-judge
+        from app.services.evaluator import _build_context_text, run_judge, save_query_log
+        context_text = _build_context_text(ui_data.get("sources") or [])
+        log_id = save_query_log(
+            question=payload.question,
+            mode="answer",
+            answer=(ui_data.get("answer") or "")[:4000],
+            context_text=context_text,
+            model=payload.model,
+            elapsed_ms=elapsed_ms,
+        )
+        background_tasks.add_task(
+            run_judge, log_id, payload.question,
+            ui_data.get("answer") or "", context_text,
+        )
+        ui_data["log_id"] = log_id
+        return ui_data
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Answer generation failed: {exc}") from exc
 
 
 @router.post("/compare")
-def compare_route(payload: CompareRequest) -> dict[str, Any]:
+def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
     """
     Semantic retrieval → group by source → drop sources below min_score →
     LLM synthesis only over truly relevant guidelines.
     """
+    import time as _time
+    t0 = _time.time()
     try:
         retrieval = retrieve(
             payload.question,
@@ -336,6 +359,23 @@ def compare_route(payload: CompareRequest) -> dict[str, Any]:
         # Sort by score descending
         source_rows.sort(key=lambda r: r["score"], reverse=True)
 
+        elapsed_ms = int((_time.time() - t0) * 1000)
+        answer_text = structured.get("recommendation") or structured.get("consensus") or ""
+
+        from app.services.evaluator import _build_context_from_compare_sources, run_judge, save_query_log
+        context_text = _build_context_from_compare_sources(source_rows)
+        log_id = save_query_log(
+            question=payload.question,
+            mode="compare",
+            answer=answer_text[:4000],
+            context_text=context_text,
+            model=payload.model,
+            elapsed_ms=elapsed_ms,
+        )
+        background_tasks.add_task(
+            run_judge, log_id, payload.question, answer_text, context_text,
+        )
+
         return {
             "question": payload.question,
             "effective_query": retrieval.effective_query,
@@ -344,6 +384,7 @@ def compare_route(payload: CompareRequest) -> dict[str, Any]:
             "consensus": structured.get("consensus"),
             "disagreements": structured.get("disagreements") or [],
             "recommendation": structured.get("recommendation"),
+            "log_id": log_id,
         }
 
     except Exception as exc:
@@ -420,6 +461,115 @@ async def upload_document(
             "Статус появится в блоке «Статус индексации» внизу страницы."
         ),
     )
+
+
+class FeedbackRequest(BaseModel):
+    feedback: int  # 1 = 👍, -1 = 👎
+
+
+@router.post("/feedback/{log_id}")
+def submit_feedback(log_id: int, payload: FeedbackRequest) -> dict[str, Any]:
+    """Record user thumbs-up / thumbs-down for a query log entry."""
+    if payload.feedback not in (1, -1):
+        raise HTTPException(status_code=400, detail="feedback must be 1 or -1")
+    from app.models import QueryLog
+    with session_scope() as session:
+        log = session.get(QueryLog, log_id)
+        if log is None:
+            raise HTTPException(status_code=404, detail=f"log_id {log_id} not found")
+        log.user_feedback = payload.feedback
+    return {"log_id": log_id, "feedback": payload.feedback, "status": "saved"}
+
+
+@router.get("/metrics")
+def get_metrics(limit: int = 50) -> dict[str, Any]:
+    """Return aggregated LLM-judge scores and user feedback statistics."""
+    from app.models import QueryLog
+    from sqlalchemy import case, cast, Float
+
+    with session_scope() as session:
+        total = session.scalar(select(func.count(QueryLog.id))) or 0
+        if total == 0:
+            return {
+                "total_queries": 0,
+                "by_mode": {},
+                "avg_scores": {},
+                "feedback": {"thumbs_up": 0, "thumbs_down": 0, "not_rated": 0},
+                "recent": [],
+            }
+
+        # Per-mode counts
+        mode_rows = session.execute(
+            select(QueryLog.mode, func.count(QueryLog.id).label("n"))
+            .group_by(QueryLog.mode)
+        ).all()
+        by_mode = {r.mode: r.n for r in mode_rows}
+
+        # Average scores (only rows where judge ran)
+        scored = session.execute(
+            select(
+                func.round(cast(func.avg(QueryLog.score_faithfulness), Float), 2).label("faithfulness"),
+                func.round(cast(func.avg(QueryLog.score_relevance), Float), 2).label("relevance"),
+                func.round(cast(func.avg(QueryLog.score_completeness), Float), 2).label("completeness"),
+                func.round(cast(func.avg(QueryLog.score_consistency), Float), 2).label("consistency"),
+                func.count(QueryLog.score_faithfulness).label("judged_count"),
+            )
+            .where(QueryLog.score_faithfulness.is_not(None))
+        ).one()
+
+        avg_scores = {
+            "faithfulness": scored.faithfulness,
+            "relevance": scored.relevance,
+            "completeness": scored.completeness,
+            "consistency": scored.consistency,
+            "judged_count": scored.judged_count,
+        }
+
+        # User feedback distribution
+        fb_up = session.scalar(
+            select(func.count(QueryLog.id)).where(QueryLog.user_feedback == 1)
+        ) or 0
+        fb_down = session.scalar(
+            select(func.count(QueryLog.id)).where(QueryLog.user_feedback == -1)
+        ) or 0
+        feedback = {
+            "thumbs_up": fb_up,
+            "thumbs_down": fb_down,
+            "not_rated": total - fb_up - fb_down,
+        }
+
+        # Recent queries
+        rows = session.execute(
+            select(QueryLog)
+            .order_by(QueryLog.created_at.desc())
+            .limit(limit)
+        ).scalars().all()
+
+        recent = [
+            {
+                "id": r.id,
+                "question": r.question[:120],
+                "mode": r.mode,
+                "model": r.model,
+                "elapsed_ms": r.elapsed_ms,
+                "score_faithfulness": r.score_faithfulness,
+                "score_relevance": r.score_relevance,
+                "score_completeness": r.score_completeness,
+                "score_consistency": r.score_consistency,
+                "judge_reasoning": r.judge_reasoning,
+                "user_feedback": r.user_feedback,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+
+    return {
+        "total_queries": total,
+        "by_mode": by_mode,
+        "avg_scores": avg_scores,
+        "feedback": feedback,
+        "recent": recent,
+    }
 
 
 def _generate_summary_task(document_id: int, model_family: str) -> None:

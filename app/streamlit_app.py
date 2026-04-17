@@ -55,6 +55,14 @@ def load_sources() -> list[dict]:
         return []
 
 
+def api_feedback(log_id: int, feedback: int) -> None:
+    requests.post(
+        f"{API_BASE_URL}/feedback/{log_id}",
+        json={"feedback": feedback},
+        timeout=10,
+    ).raise_for_status()
+
+
 def api_upload(file_bytes: bytes, filename: str) -> dict[str, Any]:
     r = requests.post(
         f"{API_BASE_URL}/upload",
@@ -197,11 +205,38 @@ def render_status() -> None:
 
 # ── Result renderers ──────────────────────────────────────────────────────────
 
+def render_feedback_buttons(log_id: int | None, key_prefix: str) -> None:
+    """Render 👍/👎 feedback buttons for a query."""
+    if log_id is None:
+        return
+    fb_key = f"fb_sent_{log_id}"
+    if st.session_state.get(fb_key):
+        st.caption("✅ Спасибо за оценку!")
+        return
+    st.markdown("**Был ли ответ полезен?**")
+    c1, c2, _ = st.columns([1, 1, 6])
+    if c1.button("👍 Да", key=f"{key_prefix}_up"):
+        try:
+            api_feedback(log_id, 1)
+            st.session_state[fb_key] = True
+            st.rerun()
+        except Exception:
+            st.error("Не удалось отправить оценку.")
+    if c2.button("👎 Нет", key=f"{key_prefix}_down"):
+        try:
+            api_feedback(log_id, -1)
+            st.session_state[fb_key] = True
+            st.rerun()
+        except Exception:
+            st.error("Не удалось отправить оценку.")
+
+
 def render_answer_result(data: dict) -> None:
     answer = (data.get("answer") or "").strip()
     sources = data.get("sources") or []
     disclaimer = data.get("disclaimer") or ""
     effective_query = data.get("effective_query") or ""
+    log_id = data.get("log_id")
 
     if not answer:
         st.warning("Ответ не получен. Попробуйте переформулировать вопрос.")
@@ -213,6 +248,8 @@ def render_answer_result(data: dict) -> None:
         st.caption(f"⚕️ {disclaimer}")
     if effective_query:
         st.caption(f"🔍 Поисковый запрос: `{effective_query}`")
+
+    render_feedback_buttons(log_id, "answer")
 
     if sources:
         with st.expander(f"📎 Найденные фрагменты ({len(sources)})", expanded=False):
@@ -241,6 +278,7 @@ def render_compare_result(data: dict) -> None:
     disagreements = data.get("disagreements") or []
     recommendation = data.get("recommendation")
     effective_query = data.get("effective_query") or ""
+    log_id = data.get("log_id")
 
     if effective_query:
         st.caption(f"🔍 Поисковый запрос: `{effective_query}`")
@@ -345,6 +383,8 @@ def render_compare_result(data: dict) -> None:
         st.info(f"**💡 Итоговая рекомендация**\n\n{recommendation}")
 
     st.caption("_Информация носит справочный характер и не заменяет врачебное решение._")
+
+    render_feedback_buttons(log_id, "compare")
 
 
 # ── Main layout ───────────────────────────────────────────────────────────────
