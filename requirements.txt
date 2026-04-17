@@ -7,6 +7,13 @@ beautifulsoup4>=4.12
 pypdf>=4.2
 cryptography>=3.1
 openai
+
+# =========================
+# Optional LLM providers
+# =========================
+# Uncomment to enable Anthropic Claude support (LLM_PROVIDER=anthropic):
+# anthropic>=0.30
+
 # =========================
 # API
 # =========================

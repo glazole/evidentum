@@ -1058,8 +1058,8 @@ def main() -> None:
 
     if args.enrich and ingested_document_ids:
         from app.services.enricher import enrich_chunks
-        from app.services.llm import YandexLLMClient
-        llm = YandexLLMClient(model_family=args.enrich_model)
+        from app.services.llm import get_llm_client
+        llm = get_llm_client(model_family=args.enrich_model)
         for doc_id in ingested_document_ids:
             print(f"[enrich] document_id={doc_id}")
             stats = enrich_chunks(doc_id, llm=llm)

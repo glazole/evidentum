@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from app.db import session_scope
 from app.models import Chunk, Document
-from app.services.llm import YandexLLMClient
+from app.services.llm import BaseLLMClient, get_llm_client
 
 
 ENRICH_SYSTEM_PROMPT = (
@@ -57,7 +57,7 @@ def enrich_chunks(
     only_missing: bool = True,
     batch_size: int = 4,
     sleep_between_batches: float = 0.5,
-    llm: YandexLLMClient | None = None,
+    llm: BaseLLMClient | None = None,
     debug: bool = False,
 ) -> EnrichStats:
     """
@@ -65,7 +65,7 @@ def enrich_chunks(
     Writes summary, nosology, specialty, topic, evidence_level to each Chunk.
     """
     if llm is None:
-        llm = YandexLLMClient(debug=debug)
+        llm = get_llm_client(debug=debug)
 
     stats = EnrichStats(document_id=document_id)
 
@@ -151,7 +151,7 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    llm = YandexLLMClient(debug=args.debug)
+    llm = get_llm_client(debug=args.debug)
     stats = enrich_chunks(
         document_id=args.document_id,
         only_missing=not args.reenrich,

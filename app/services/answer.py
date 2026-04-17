@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
-
-from openai import OpenAI
 
 try:
     from app.services.retriever import RetrievalResult, retrieve
@@ -14,25 +11,14 @@ except Exception:  # pragma: no cover
     retrieve = None  # type: ignore
     RetrievalResult = None  # type: ignore
 
+from app.services.llm import BaseLLMClient, get_llm_client
 
-YC_OPENAI_BASE_URL = os.getenv("YC_OPENAI_BASE_URL", "https://llm.api.cloud.yandex.net/v1")
-YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "")
-YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
 
 DEFAULT_MODEL_FAMILY = os.getenv("ANSWER_MODEL_FAMILY", "alice")
 DEFAULT_TEMPERATURE = float(os.getenv("ANSWER_TEMPERATURE", "0.2"))
 DEFAULT_TOP_K = int(os.getenv("ANSWER_TOP_K", "6"))
 DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("ANSWER_MAX_OUTPUT_TOKENS", "1800"))
 DEFAULT_TRANSLATE_MODE = os.getenv("ANSWER_TRANSLATE_MODE", "dual_query")
-
-MODEL_ALIASES = {
-    "yandex": "yandexgpt-5.1",
-    "yandexgpt": "yandexgpt-5.1",
-    "pro": "yandexgpt-5.1",
-    "alice": "aliceai-llm",
-    "aliceai": "aliceai-llm",
-    "lite": "yandexgpt-lite",
-}
 
 
 @dataclass
@@ -68,28 +54,26 @@ class AnswerResult:
 
 
 class YandexOpenAIAnswerer:
+    """
+    LLM-based answerer for clinical guideline questions.
+
+    Provider-agnostic: delegates all LLM calls to a BaseLLMClient instance.
+    By default creates a client via get_llm_client() which respects LLM_PROVIDER
+    env var (yandex | openai | anthropic). Pass ``llm=`` to override.
+    """
+
     def __init__(
         self,
         *,
-        folder_id: str = YANDEX_FOLDER_ID,
-        api_key: str = YANDEX_API_KEY,
-        base_url: str = YC_OPENAI_BASE_URL,
         default_model_family: str = DEFAULT_MODEL_FAMILY,
+        llm: BaseLLMClient | None = None,
     ) -> None:
-        if not folder_id:
-            raise ValueError("YANDEX_FOLDER_ID is empty")
-        if not api_key:
-            raise ValueError("YANDEX_API_KEY is empty")
-
-        self.folder_id = folder_id
-        self.base_url = base_url.rstrip("/")
         self.default_model_family = default_model_family
-        self.client = OpenAI(base_url=self.base_url, api_key=api_key)
+        self.llm = llm if llm is not None else get_llm_client()
 
     def build_model_uri(self, model_family: str | None = None) -> str:
-        family = (model_family or self.default_model_family or "alice").strip().lower()
-        model_id = MODEL_ALIASES.get(family, family)
-        return f"gpt://{self.folder_id}/{model_id}/latest"
+        """Return provider-canonical model name/URI for the given alias."""
+        return self.llm.resolve_model(model_family or self.default_model_family)
 
     def generate(
         self,
@@ -133,19 +117,16 @@ class YandexOpenAIAnswerer:
             + "\n\n".join(context_parts)
         )
 
-        completion = self.client.chat.completions.create(
-            model=model_uri,
-            temperature=temperature,
-            max_tokens=max_output_tokens,
-            messages=[
+        answer = self.llm.complete(
+            [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            model=model_family,
+            temperature=temperature,
+            max_tokens=max_output_tokens,
         )
-
-        answer = completion.choices[0].message.content or ""
-        raw_payload = completion.model_dump() if return_raw and hasattr(completion, "model_dump") else None
-        return answer.strip(), model_uri, raw_payload
+        return answer, model_uri, None
 
     def synthesize_structured(
         self,
@@ -217,45 +198,16 @@ class YandexOpenAIAnswerer:
             "В поле sources пиши название гайдлайна из заголовка '=== ГАЙДЛАЙН: ... ===', не номер фрагмента."
         )
 
-        import json as _json
-        import re as _re
-
         try:
-            completion = self.client.chat.completions.create(
-                model=model_uri,
+            return self.llm.complete_json(
+                user_prompt,
+                system_prompt=system_prompt,
+                model=model_family,
                 temperature=temperature,
                 max_tokens=max_output_tokens,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
             )
-            raw = (completion.choices[0].message.content or "").strip()
-
-            # Try direct parse
-            try:
-                return _json.loads(raw)
-            except _json.JSONDecodeError:
-                pass
-
-            # Strip markdown fences
-            stripped = _re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
-            try:
-                return _json.loads(stripped)
-            except _json.JSONDecodeError:
-                pass
-
-            # Extract first {...} block
-            m = _re.search(r"\{.*\}", stripped, _re.DOTALL)
-            if m:
-                try:
-                    return _json.loads(m.group(0))
-                except _json.JSONDecodeError:
-                    pass
         except Exception:
-            pass
-
-        return {}
+            return {}
 
 
 def _load_system_prompt() -> str:

@@ -364,8 +364,8 @@ def get_document_summary(document_id: int) -> DocumentSummaryResponse:
 def _generate_summary_task(document_id: int, model_family: str) -> None:
     try:
         from app.services.summarizer import generate_document_summary
-        from app.services.llm import YandexLLMClient
-        llm = YandexLLMClient(model_family=model_family)
+        from app.services.llm import get_llm_client
+        llm = get_llm_client(model_family=model_family)
         generate_document_summary(document_id, llm=llm)
     except Exception as exc:
         import sys

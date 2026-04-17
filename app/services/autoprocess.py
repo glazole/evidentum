@@ -33,7 +33,7 @@ def _generate_title(document_id: int) -> None:
         from sqlalchemy import select
         from app.db import session_scope
         from app.models import Chunk, Document
-        from app.services.llm import YandexLLMClient
+        from app.services.llm import get_llm_client
 
         with session_scope() as s:
             doc = s.get(Document, document_id)
@@ -50,7 +50,7 @@ def _generate_title(document_id: int) -> None:
             ).all()
             context = "\n\n".join(samples[:3])[:2000]
 
-        llm = YandexLLMClient()
+        llm = get_llm_client()
         prompt = (
             f"source_id: {doc.source_id}\n\n"
             f"Первые фрагменты документа:\n{context}\n\n"
@@ -134,7 +134,7 @@ def run_autoprocess(data_dir: Path = DATA_RAW_DIR) -> None:
             from app.db import session_scope
             from app.models import Chunk
             from app.services.enricher import enrich_chunks
-            from app.services.llm import YandexLLMClient
+            from app.services.llm import get_llm_client
 
             with session_scope() as s:
                 rows = s.execute(
@@ -148,7 +148,7 @@ def run_autoprocess(data_dir: Path = DATA_RAW_DIR) -> None:
                 print("[autoprocess] all chunks already enriched", file=sys.stderr)
                 return
 
-            llm = YandexLLMClient()
+            llm = get_llm_client()
             for doc_id in doc_ids:
                 print(f"[autoprocess] enriching doc {doc_id}…", file=sys.stderr)
                 try:

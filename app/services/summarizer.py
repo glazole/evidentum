@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.db import session_scope
 from app.models import Chunk, Document
-from app.services.llm import YandexLLMClient
+from app.services.llm import BaseLLMClient, get_llm_client
 
 
 SUMMARIZE_SYSTEM_PROMPT = (
@@ -64,7 +64,7 @@ def _collect_section_summaries(document_id: int, session: Any) -> str:
 def generate_document_summary(
     document_id: int,
     *,
-    llm: YandexLLMClient | None = None,
+    llm: BaseLLMClient | None = None,
     debug: bool = False,
 ) -> Document:
     """
@@ -72,7 +72,7 @@ def generate_document_summary(
     Saves results to DB and returns the updated Document.
     """
     if llm is None:
-        llm = YandexLLMClient(debug=debug)
+        llm = get_llm_client(debug=debug)
 
     with session_scope() as session:
         doc = session.scalar(select(Document).where(Document.id == document_id))
@@ -139,7 +139,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
-    llm = YandexLLMClient(debug=args.debug)
+    llm = get_llm_client(debug=args.debug)
     doc = generate_document_summary(args.document_id, llm=llm, debug=args.debug)
     print(f"document_id={doc.id}")
     print(f"summary_ru={doc.summary_ru[:300] if doc.summary_ru else None}")

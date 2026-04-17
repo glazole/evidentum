@@ -8,21 +8,24 @@
 ## 1. Обзор системы
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                          Docker Compose                          │
-│                                                                  │
-│  ┌───────────┐    REST     ┌───────────┐    SQL/pgvector         │
-│  │  Streamlit│ ──────────► │  FastAPI  │ ──────────────► ┌─────┐ │
-│  │   (UI)    │             │   (API)   │                 │  PG │ │
-│  │  :7860    │ ◄────────── │   :8000   │ ◄────────────── │  DB │ │
-│  └───────────┘   JSON      └─────┬─────┘                 └─────┘ │
-│                                  │                               │
-│                         Yandex Foundation Models (HTTPS)         │
-│                         ┌────────┼─────────────────┐            │
-│                         ▼        ▼                  ▼            │
-│                    Embeddings  YandexGPT        Translate        │
-│                    (256-dim)  (AliceAI/5.1)     (RU↔EN)          │
-└──────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                           Docker Compose                          │
+│                                                                   │
+│  ┌───────────┐    REST     ┌───────────┐    SQL/pgvector          │
+│  │  Streamlit│ ──────────► │  FastAPI  │ ──────────────► ┌──────┐ │
+│  │   (UI)    │             │   (API)   │                 │  PG  │ │
+│  │  :7860    │ ◄────────── │   :8000   │ ◄────────────── │  DB  │ │
+│  └───────────┘   JSON      └─────┬─────┘                 └──────┘ │
+│                                  │                                │
+│                    ┌─────────────┼──────────────────┐            │
+│                    │     Yandex Foundation Models    │            │
+│                    │  (Embeddings · GPT · Translate) │            │
+│                    └─────────────────────────────────┘            │
+│                                                                   │
+│   LLM-провайдер выбирается через LLM_PROVIDER в .env:            │
+│   yandex (default) │ openai (ChatGPT) │ anthropic (Claude)        │
+│   Embeddings и Translate — всегда Yandex (не зависят от LLM)     │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 Три Docker-контейнера:
@@ -299,15 +302,18 @@ app/
 ├── api/
 │   └── routes.py         # APIRouter: /health /sources /answer /compare /retrieve
 │
+├── prompts/
+│   └── answer_system.txt # System prompt для режима «Ответ»
+│
 └── services/
     ├── ingest.py         # PDF/HTML → Document + Chunks
     ├── embedder.py       # Chunks → vector(256) via Yandex Embeddings
-    ├── enricher.py       # Chunks → summary/nosology/topic via YandexGPT
+    ├── enricher.py       # Chunks → summary/nosology/topic via LLM
     ├── retriever.py      # Query → RetrievalResult (dual_query + reranking)
     ├── answer.py         # RetrievalResult → AnswerResult (plain или structured)
     ├── summarizer.py     # Document → summary_ru + version_delta_ru
     ├── autoprocess.py    # Оркестратор: ingest → embed → titles → enrich
-    └── llm.py            # YandexLLMClient (OpenAI-compatible, retry, JSON parsing)
+    └── llm.py            # Мультипровайдерный LLM-клиент (см. раздел 12)
 ```
 
 ### Ключевые классы и типы
@@ -320,8 +326,12 @@ app/
 | `RetrievalResult` | retriever.py | dataclass: полный результат поиска |
 | `SourceItem` | answer.py | dataclass: фрагмент для LLM-контекста |
 | `AnswerResult` | answer.py | dataclass: готовый ответ системы |
-| `YandexOpenAIAnswerer` | answer.py | LLM-клиент через OpenAI-compatible API |
-| `YandexLLMClient` | llm.py | Универсальный LLM-клиент с `complete_json()` |
+| `YandexOpenAIAnswerer` | answer.py | Провайдер-независимый синтезатор ответов |
+| `BaseLLMClient` | llm.py | Абстрактный базовый класс для всех LLM-клиентов |
+| `YandexLLMClient` | llm.py | Реализация для Yandex Foundation Models |
+| `OpenAILLMClient` | llm.py | Реализация для ChatGPT (и совместимых API) |
+| `AnthropicLLMClient` | llm.py | Реализация для Anthropic Claude |
+| `get_llm_client()` | llm.py | Фабрика: создаёт клиент по `LLM_PROVIDER` из `.env` |
 
 ---
 
@@ -367,17 +377,27 @@ app/
 
 ---
 
-## 6. Yandex Foundation Models — использование
+## 6. Внешние сервисы — использование
+
+### Yandex (Embeddings и Translate — всегда Yandex)
 
 | Сервис | Модель / endpoint | Применение |
 |--------|-------------------|------------|
 | Embeddings | `emb://folder/text-search-doc/latest` | Индексация фрагментов (dim=256) |
 | Embeddings | `emb://folder/text-search-query/latest` | Эмбеддинг пользовательского запроса |
 | Translate | `translate.api.cloud.yandex.net` | RU→EN для dual_query; опционально EN→RU для хитов |
-| YandexGPT | `gpt://folder/aliceai-llm/latest` | Обогащение чанков, генерация ответов (быстрее) |
-| YandexGPT | `gpt://folder/yandexgpt-5.1/latest` | Сравнение и синтез (точнее) |
 
 **Аутентификация**: `Api-Key` в заголовке `Authorization` + `x-folder-id`.
+
+### LLM — выбирается через `LLM_PROVIDER` в `.env`
+
+| LLM_PROVIDER | Модель (default) | Модели alias "lite" | Аутентификация |
+|---|---|---|---|
+| `yandex` (default) | `gpt://folder/yandexgpt-5.1/latest` | `yandexgpt-lite` | `YANDEX_API_KEY` |
+| `openai` | `gpt-4o` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| `anthropic` | `claude-sonnet-4-5` | `claude-haiku-3-5` | `ANTHROPIC_API_KEY` |
+
+Alias-таблицы в `llm.py` (`YANDEX_MODEL_ALIASES`, `OPENAI_MODEL_ALIASES`, `ANTHROPIC_MODEL_ALIASES`) позволяют использовать одинаковые псевдонимы (`alice`, `pro`, `lite`) для любого провайдера — смена LLM требует только изменения `.env`.
 
 ---
 
@@ -505,3 +525,86 @@ IBD (arch.md, стр. 31): LLM получает контекст из разны
 Наша система (`synthesize_structured`): JSON-схема `{positions, consensus, disagreements, recommendation}`
 
 Архитектурный подход идентичен. Разница только в **синхронности** подготовки данных.
+
+---
+
+## 12. Мультипровайдерный LLM-клиент
+
+### Мотивация
+
+Изначально система использовала только Yandex GPT. Для возможности переключиться на ChatGPT или Claude (например, при проблемах с доступностью Yandex API или для повышения качества) введена единая абстракция LLM-клиента.
+
+### Иерархия классов (`app/services/llm.py`)
+
+```
+BaseLLMClient  (ABC)
+│   .complete(messages, *, model, temperature, max_tokens) → str
+│   .resolve_model(model) → str          ← URI или имя для логов
+│   .complete_json(prompt, *, system_prompt, ...) → dict   ← в базовом классе
+│
+├── YandexLLMClient   — Yandex Foundation Models (OpenAI-compatible endpoint)
+│     YANDEX_FOLDER_ID + YANDEX_API_KEY
+│     model URI: gpt://{folder_id}/{model_id}/latest
+│
+├── OpenAILLMClient   — OpenAI ChatGPT (или Azure OpenAI / LM Studio)
+│     OPENAI_API_KEY
+│     model name: gpt-4o, gpt-4o-mini, gpt-4-turbo, …
+│
+└── AnthropicLLMClient — Anthropic Claude
+      ANTHROPIC_API_KEY  +  pip install anthropic
+      model name: claude-sonnet-4-5, claude-opus-4-5, claude-haiku-3-5, …
+      ⚠ Anthropic имеет отдельный параметр system= (не внутри messages[])
+        — обрабатывается прозрачно в complete()
+```
+
+### Фабрика `get_llm_client()`
+
+```python
+# Вернёт клиент по LLM_PROVIDER из .env:
+llm = get_llm_client()
+
+# Принудительно указать провайдер:
+llm = get_llm_client("openai")
+
+# Переопределить модель для одного вызова:
+llm = get_llm_client(model_family="gpt4o-mini")
+```
+
+Все сервисы (`enricher.py`, `summarizer.py`, `autoprocess.py`, `routes.py`, `ingest.py`) вызывают `get_llm_client()` — смена провайдера не требует правки кода.
+
+### Как добавить новый провайдер
+
+1. Добавить класс `XxxLLMClient(BaseLLMClient)` в `llm.py`, реализовав `complete()` и `resolve_model()`
+2. Добавить alias-таблицу `XXX_MODEL_ALIASES` с маппингом `"alice" → "модель-xxx-эквивалент"`
+3. Добавить ветку в `get_llm_client()`:
+   ```python
+   if p in ("xxx", "xxx-alias"):
+       return XxxLLMClient(**kwargs)
+   ```
+4. Добавить `LLM_PROVIDER=xxx` и `XXX_API_KEY=...` в `.env`
+5. Больше ничего менять не нужно
+
+### Переключение провайдера (только `.env`)
+
+```bash
+# ChatGPT:
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+LLM_MODEL_FAMILY=gpt4o        # или gpt4o-mini для экономии
+
+# Claude:
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_MODEL_FAMILY=sonnet        # opus | sonnet | haiku
+
+# Yandex (default):
+LLM_PROVIDER=yandex
+```
+
+После изменения `.env` — `docker compose restart api`.
+
+### Что не зависит от LLM_PROVIDER
+
+- **Embeddings** — всегда Yandex (`YANDEX_EMBEDDINGS_URL`), т.к. индекс построен на `vector(256)` от Yandex
+- **Translate** — всегда Yandex (`YANDEX_TRANSLATE_URL`), используется для `dual_query`
+- **pgvector** — инфраструктура БД не меняется
