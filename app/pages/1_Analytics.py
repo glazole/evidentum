@@ -82,14 +82,15 @@ else:
         ("consistency", "Согласованность", "Нет внутренних противоречий"),
     ]
     for col, (key, label, help_text) in zip(score_cols, criteria):
-        val = avg.get(key)
+        raw = avg.get(key)
+        val = float(raw) if raw is not None else None
         val_str = f"{val:.2f} / 5" if val is not None else "—"
         delta = f"{(val - 3):.2f}" if val is not None else None
         col.metric(label, val_str, delta=delta, help=help_text)
 
     # Bar chart of average scores
     chart_data = {
-        c[1]: [avg.get(c[0]) or 0]
+        c[1]: [float(avg.get(c[0]) or 0)]
         for c in criteria
     }
     import pandas as pd
@@ -135,9 +136,9 @@ else:
     rows = []
     for r in recent:
         fb_icon = {1: "👍", -1: "👎"}.get(r.get("user_feedback"), "—")
-        scores = [r.get(f"score_{k}") for k in ("faithfulness", "relevance", "completeness", "consistency")]
-        avg_score = sum(s for s in scores if s is not None)
-        avg_score_count = sum(1 for s in scores if s is not None)
+        scores = [float(r[f"score_{k}"]) for k in ("faithfulness", "relevance", "completeness", "consistency") if r.get(f"score_{k}") is not None]
+        avg_score = sum(scores)
+        avg_score_count = len(scores)
         avg_val = f"{avg_score / avg_score_count:.2f}" if avg_score_count else "—"
         rows.append({
             "ID": r["id"],
