@@ -104,3 +104,5 @@ volumes:
 
 networks:
   mvp-net:
+    external: true
+    name: drug-code-resolver_mvp-net
