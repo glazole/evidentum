@@ -506,12 +506,14 @@ def get_metrics(limit: int = 50) -> dict[str, Any]:
         by_mode = {r.mode: r.n for r in mode_rows}
 
         # Average scores (only rows where judge ran)
+        # Note: PostgreSQL round(float8, n) does not exist — cast to numeric first
+        from sqlalchemy import Numeric
         scored = session.execute(
             select(
-                func.round(cast(func.avg(QueryLog.score_faithfulness), Float), 2).label("faithfulness"),
-                func.round(cast(func.avg(QueryLog.score_relevance), Float), 2).label("relevance"),
-                func.round(cast(func.avg(QueryLog.score_completeness), Float), 2).label("completeness"),
-                func.round(cast(func.avg(QueryLog.score_consistency), Float), 2).label("consistency"),
+                func.round(cast(func.avg(QueryLog.score_faithfulness), Numeric), 2).label("faithfulness"),
+                func.round(cast(func.avg(QueryLog.score_relevance), Numeric), 2).label("relevance"),
+                func.round(cast(func.avg(QueryLog.score_completeness), Numeric), 2).label("completeness"),
+                func.round(cast(func.avg(QueryLog.score_consistency), Numeric), 2).label("consistency"),
                 func.count(QueryLog.score_faithfulness).label("judged_count"),
             )
             .where(QueryLog.score_faithfulness.is_not(None))

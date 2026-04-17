@@ -242,14 +242,14 @@ def render_answer_result(data: dict) -> None:
         st.warning("Ответ не получен. Попробуйте переформулировать вопрос.")
         return
 
+    render_feedback_buttons(log_id, "answer")
+    st.divider()
     st.markdown(answer)
 
     if disclaimer:
         st.caption(f"⚕️ {disclaimer}")
     if effective_query:
         st.caption(f"🔍 Поисковый запрос: `{effective_query}`")
-
-    render_feedback_buttons(log_id, "answer")
 
     if sources:
         with st.expander(f"📎 Найденные фрагменты ({len(sources)})", expanded=False):
@@ -290,38 +290,90 @@ def render_compare_result(data: dict) -> None:
         )
         return
 
-    # Build positions lookup: label → text (LLM-generated per-source answer)
+    # Build positions lookup: label → {text, evidence_levels}
     positions_by_label: dict[str, str] = {}
     for p in positions_list:
         src_key = (p.get("source") or "").strip()
         if src_key:
             positions_by_label[src_key] = (p.get("text") or "").strip()
 
-    # ── Per-source blocks ────────────────────────────────────────────────────
-    st.subheader(f"Позиции источников — {len(sources)} гайдлайн(а/ов)")
+    # Collect evidence levels per source from fragments
+    def _collect_evidence(s: dict) -> str:
+        levels: list[str] = []
+        for frag in (s.get("fragments") or []):
+            ev = (frag.get("evidence_level") or "").strip()
+            if ev and ev not in levels:
+                levels.append(ev)
+        return ", ".join(levels) if levels else "—"
+
+    # ── 1. Feedback buttons ───────────────────────────────────────────────────
+    render_feedback_buttons(log_id, "compare")
+    st.divider()
+
+    # ── 2. Comparison table ───────────────────────────────────────────────────
+    st.subheader("Сравнение позиций")
 
     for s in sources:
-        score = s.get("score")
         label = s.get("label") or display_name(s)
-        url = s.get("url")
-        score_str = f"  `score {score:.2f}`" if score is not None else ""
-        header = f"**{label}**{score_str}"
+        pos_text = positions_by_label.get(label) or (s.get("combined_text") or "")[:300]
+        ev_levels = _collect_evidence(s)
+        score = s.get("score")
+        score_str = f"\n\n`score {score:.2f}`" if score is not None else ""
 
-        with st.expander(header, expanded=True):
+        col_name, col_ev, col_pos = st.columns([2, 1, 3], gap="medium")
+        with col_name:
+            st.markdown(f"**{label}**{score_str}")
+        with col_ev:
+            st.markdown(f"**УД**\n\n{ev_levels}")
+        with col_pos:
+            st.markdown(pos_text or "_нет данных_")
+        st.divider()
+
+    # ── 3. Synthesis & disagreements ──────────────────────────────────────────
+    st.subheader("Анализ")
+
+    if consensus:
+        st.success(f"**✅ Консенсус**\n\n{consensus}")
+    else:
+        st.caption("Единый консенсус между источниками не выявлен.")
+
+    if disagreements:
+        st.subheader("⚡ Расхождения")
+        for item in disagreements:
+            src_list = item.get("sources") or []
+            text = (item.get("text") or "").strip()
+            with st.container(border=True):
+                for src_name in src_list:
+                    st.markdown(f"🔹 **{src_name}**")
+                if text:
+                    st.markdown(text)
+    elif consensus:
+        st.info("Существенных расхождений между источниками не выявлено.")
+
+    if recommendation:
+        st.info(f"**💡 Итоговая рекомендация**\n\n{recommendation}")
+
+    # ── 4. Per-source detail blocks (collapsed, at the bottom) ────────────────
+    st.divider()
+    with st.expander(f"📚 Позиции источников — подробно ({len(sources)} гайдлайн(а/ов))", expanded=False):
+        for s in sources:
+            score = s.get("score")
+            label = s.get("label") or display_name(s)
+            url = s.get("url")
+            score_str = f"  `score {score:.2f}`" if score is not None else ""
+
+            st.markdown(f"### {label}{score_str}")
             if url:
                 st.caption(f"📄 [Перейти к источнику]({url})")
 
-            # LLM position on this specific question
             position_text = positions_by_label.get(label, "")
             if position_text:
                 st.markdown(position_text)
             else:
-                # Fallback: show combined raw text
                 combined = (s.get("combined_text") or "").strip()
                 if combined:
                     st.markdown(combined[:900] + (" …" if len(combined) > 900 else ""))
 
-            # Numbered fragment list
             fragments = s.get("fragments") or []
             if fragments:
                 st.markdown("---")
@@ -340,47 +392,7 @@ def render_compare_result(data: dict) -> None:
                     if text:
                         with st.expander("Полный текст фрагмента", expanded=False):
                             st.markdown(text[:700] + (" …" if len(text) > 700 else ""))
-
-    # ── Comparison table ──────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Сравнение позиций")
-
-    for s in sources:
-        label = s.get("label") or display_name(s)
-        pos_text = positions_by_label.get(label) or (s.get("combined_text") or "")[:300]
-        col_name, col_pos = st.columns([1, 2], gap="medium")
-        with col_name:
-            score = s.get("score")
-            score_str = f"\n\n`score {score:.2f}`" if score is not None else ""
-            st.markdown(f"**{label}**{score_str}")
-        with col_pos:
-            st.markdown(pos_text or "_нет данных_")
-        st.divider()
-
-    # ── Synthesis ─────────────────────────────────────────────────────────────
-    st.subheader("Анализ")
-
-    if consensus:
-        st.success(f"**✅ Консенсус**\n\n{consensus}")
-    else:
-        st.caption("Единый консенсус между источниками не выявлен.")
-
-    if disagreements:
-        st.subheader("⚡ Расхождения")
-        for item in disagreements:
-            src_list = item.get("sources") or []
-            text = (item.get("text") or "").strip()
-            with st.container(border=True):
-                # Each source on its own line as a badge
-                for src_name in src_list:
-                    st.markdown(f"🔹 **{src_name}**")
-                if text:
-                    st.markdown(text)
-    elif consensus:
-        st.info("Существенных расхождений между источниками не выявлено.")
-
-    if recommendation:
-        st.info(f"**💡 Итоговая рекомендация**\n\n{recommendation}")
+            st.divider()
 
     st.caption("_Информация носит справочный характер и не заменяет врачебное решение._")
 
