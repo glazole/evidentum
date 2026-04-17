@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import distinct, func, select
+
+DATA_RAW_DIR = Path("/app/data/raw")
 
 from app.db import session_scope
 from app.models import Chunk, Document
@@ -359,6 +363,63 @@ def get_document_summary(document_id: int) -> DocumentSummaryResponse:
             summary_ru=getattr(doc, "summary_ru", None),
             version_delta_ru=getattr(doc, "version_delta_ru", None),
         )
+
+
+class UploadResponse(BaseModel):
+    filename: str
+    status: str          # "ingested" | "already_exists"
+    document_id: int | None = None
+    message: str
+
+
+@router.post("/upload", response_model=UploadResponse)
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+) -> UploadResponse:
+    """
+    Upload a PDF guideline file.
+    The file is saved to data/raw/, then:
+      - ingested + embedded synchronously (available for search in ~seconds)
+      - LLM-enriched asynchronously in background (quality improves over minutes)
+    """
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".pdf", ".html", ".htm"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Поддерживаются только файлы PDF и HTML.",
+        )
+
+    DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
+    dest = DATA_RAW_DIR / (file.filename or "upload.pdf")
+
+    if dest.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Файл «{file.filename}» уже существует на сервере.",
+        )
+
+    # Save file
+    with dest.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    # Process in background (ingest + embed sync, enrich async inside)
+    def _process() -> None:
+        from app.services.autoprocess import process_single_file
+        process_single_file(str(dest))
+
+    background_tasks.add_task(_process)
+
+    return UploadResponse(
+        filename=file.filename or dest.name,
+        status="ingested",
+        document_id=None,
+        message=(
+            "Файл принят. Идексация запущена в фоне: "
+            "эмбеддинги готовы через ~30 сек, LLM-обогащение — через несколько минут. "
+            "Статус появится в блоке «Статус индексации» внизу страницы."
+        ),
+    )
 
 
 def _generate_summary_task(document_id: int, model_family: str) -> None:

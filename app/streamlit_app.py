@@ -55,6 +55,16 @@ def load_sources() -> list[dict]:
         return []
 
 
+def api_upload(file_bytes: bytes, filename: str) -> dict[str, Any]:
+    r = requests.post(
+        f"{API_BASE_URL}/upload",
+        files={"file": (filename, file_bytes, "application/pdf")},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def api_answer(
     question: str,
     *,
@@ -343,6 +353,40 @@ st.title("🏥 Evidentum")
 st.caption("Поиск по клиническим рекомендациям с генерацией структурированного ответа")
 
 st.divider()
+
+# ── Upload section ────────────────────────────────────────────────────────────
+with st.expander("📤 Загрузить гайдлайн", expanded=False):
+    st.markdown(
+        "Загрузите PDF-файл клинической рекомендации. После загрузки система автоматически:\n"
+        "1. Разобьёт документ на фрагменты и построит эмбеддинги (~30 сек) — документ появится в поиске\n"
+        "2. Обогатит фрагменты через LLM: summary, нозология, специальность (несколько минут в фоне)\n\n"
+        "Прогресс отображается в блоке **«Статус индексации»** внизу страницы."
+    )
+    uploaded_file = st.file_uploader(
+        "Выберите PDF-файл",
+        type=["pdf"],
+        key="guideline_upload",
+        label_visibility="collapsed",
+    )
+    if uploaded_file is not None:
+        if st.button("⬆️ Загрузить на сервер", type="primary"):
+            with st.spinner(f"Загрузка «{uploaded_file.name}»…"):
+                try:
+                    result = api_upload(uploaded_file.getvalue(), uploaded_file.name)
+                    st.success(
+                        f"✅ **{uploaded_file.name}** принят.\n\n"
+                        f"{result.get('message', '')}"
+                    )
+                    st.cache_data.clear()
+                except requests.HTTPError as exc:
+                    code = exc.response.status_code
+                    detail = exc.response.json().get("detail", exc.response.text[:200])
+                    if code == 409:
+                        st.warning(f"⚠️ {detail}")
+                    else:
+                        st.error(f"Ошибка загрузки ({code}): {detail}")
+                except Exception as exc:
+                    st.error(f"Ошибка: {exc}")
 
 # ── Search form ───────────────────────────────────────────────────────────────
 items = load_sources()

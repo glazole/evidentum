@@ -75,6 +75,49 @@ def _generate_title(document_id: int) -> None:
         print(f"[autoprocess] title gen error doc {document_id}: {exc}", file=sys.stderr)
 
 
+def process_single_file(file_path: str) -> dict:
+    """
+    Ingest, embed, generate title and start background enrichment for one file.
+    Returns {"document_id": int, "status": "ingested"|"already_exists", "filename": str}.
+    Called immediately after a user uploads a file via the API.
+    """
+    from app.services.ingest import ingest_file
+    from app.services.embedder import embed_chunks
+
+    result = ingest_file(file_path)
+    document_id: int | None = result.get("document_id")
+
+    if not document_id:
+        return {"filename": Path(file_path).name, "status": "already_exists", "document_id": None}
+
+    # Synchronous: embed right away so search is available quickly
+    try:
+        embed_chunks(document_id=document_id)
+    except Exception as exc:
+        print(f"[autoprocess] embed error for {file_path}: {exc}", file=sys.stderr)
+
+    # Synchronous: generate readable title (fast single LLM call)
+    _generate_title(document_id)
+
+    # Async: enrichment is slow — run in background thread
+    def _enrich() -> None:
+        try:
+            from app.services.enricher import enrich_chunks
+            from app.services.embedder import embed_chunks as _embed
+            from app.services.llm import get_llm_client
+            llm = get_llm_client()
+            enrich_chunks(document_id, llm=llm)
+            _embed(document_id=document_id, only_missing=False)
+            print(f"[autoprocess] enrich+re-embed done for doc {document_id}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[autoprocess] enrich error for doc {document_id}: {exc}", file=sys.stderr)
+
+    t = threading.Thread(target=_enrich, daemon=True, name=f"enrich-upload-{document_id}")
+    t.start()
+
+    return {"filename": Path(file_path).name, "status": "ingested", "document_id": document_id}
+
+
 def run_autoprocess(data_dir: Path = DATA_RAW_DIR) -> None:
     """
     1. Ingest any new PDF/HTML files in data_dir that are not yet in the DB.
