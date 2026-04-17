@@ -165,23 +165,36 @@ class YandexOpenAIAnswerer:
             "Ты клинический ассистент. Отвечай ТОЛЬКО на русском языке. "
             "Сохраняй латинские МНН-названия препаратов. "
             "Используй ТОЛЬКО информацию из предоставленных фрагментов. "
-            "Если данных мало — скажи явно. "
+            "Если данных мало — скажи явно.\n\n"
+            "ВАЖНО: в поле 'sources' у disagreements и citations пиши ПОЛНОЕ НАЗВАНИЕ гайдлайна "
+            "(например 'ESC 2024' или 'КР МЗ РФ 2024'), НЕ номера фрагментов.\n\n"
             "Верни строгий JSON без маркдаун-разметки:\n"
             '{"consensus": "...", '
-            '"disagreements": [{"sources": ["..."], "text": "..."}], '
+            '"disagreements": [{"sources": ["Название гайдлайна"], "text": "В чём расхождение"}], '
             '"recommendation": "...", '
-            '"citations": [{"idx": 1, "source_name": "...", "section": "...", "url": "..."}]}'
+            '"citations": [{"idx": 1, "source_name": "Название гайдлайна", "section": "...", "url": "..."}]}'
         )
 
-        # Group context by guideline (source_id)
+        # Group context by guideline (source_id), build name map
         grouped: dict[str, list[SourceItem]] = {}
+        source_labels: dict[str, str] = {}
         for src in context_sources:
-            grouped.setdefault(src.source_id or "unknown", []).append(src)
+            key = src.source_id or "unknown"
+            grouped.setdefault(key, []).append(src)
+            if key not in source_labels:
+                source_labels[key] = src.title or src.source_id or key
 
-        context_parts: list[str] = []
+        # Preamble: explicit mapping so LLM knows names
+        name_map_lines = [
+            f"  {label}" for label in source_labels.values()
+        ]
+        context_parts: list[str] = [
+            "Гайдлайны в контексте:\n" + "\n".join(name_map_lines)
+        ]
+
         for source_id, sources in grouped.items():
-            title = sources[0].title or source_id
-            context_parts.append(f"### {title} ({source_id})")
+            label = source_labels[source_id]
+            context_parts.append(f"=== ГАЙДЛАЙН: {label} ===")
             for src in sources:
                 text = (src.translated_chunk_text or src.chunk_text or "").strip()
                 summary = src.summary or ""
@@ -197,7 +210,8 @@ class YandexOpenAIAnswerer:
             f"Вопрос врача: {question}\n\n"
             "Фрагменты из клинических рекомендаций:\n\n"
             + "\n\n".join(context_parts)
-            + "\n\nВерни JSON-ответ строго по схеме выше."
+            + "\n\nВерни JSON-ответ строго по схеме. "
+            "В поле sources пиши название гайдлайна из заголовка '=== ГАЙДЛАЙН: ... ===', не номер фрагмента."
         )
 
         import json as _json
