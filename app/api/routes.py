@@ -142,24 +142,39 @@ _STOP_WORDS: frozenset[str] = frozenset({
 
 
 def _tokenize_medical(text: str) -> set[str]:
-    """Tokenize medical text, expand abbreviations, strip ICD-10 codes."""
+    """Tokenize medical text, expand abbreviations, strip ICD-10 codes.
+
+    IMPORTANT: abbreviation expansion is applied BEFORE the length filter so that
+    2-char abbreviations like 'БА', 'ФП', 'АГ' are expanded into meaningful terms
+    ('астма', 'фибрилляция', 'гипертония') before short tokens are dropped.
+    """
     import re as _re
-    raw = {w.lower() for w in _re.findall(r"[а-яёa-z]+", text, _re.IGNORECASE)}
-    # Drop stopwords and very short tokens
-    raw = {w for w in raw if len(w) >= 3 and w not in _STOP_WORDS}
-    # Strip ICD-10 codes like J45, I48, C34 (letter+digits)
+    # Capture tokens >= 2 chars so 2-letter abbreviations like БА/ФП are preserved
+    raw = {w.lower() for w in _re.findall(r"[а-яёa-z]+", text, _re.IGNORECASE)
+           if len(w) >= 2}
+    # Strip ICD-10 codes like J45, I48, C34 (single letter + 1-2 digits)
     raw = {w for w in raw if not _re.fullmatch(r"[a-z]\d{1,2}", w, _re.I)}
-    # Expand abbreviations
-    expanded: set[str] = set(raw)
+
+    expanded: set[str] = set()
     for token in raw:
         if token in _MEDICAL_ABBREVS:
+            # Known abbreviation — replace with expanded terms (no length filter needed)
             for exp in _MEDICAL_ABBREVS[token].split():
                 expanded.add(exp.lower())
+        elif len(token) >= 3 and token not in _STOP_WORDS:
+            # Regular word — apply length and stopword filter
+            expanded.add(token)
     return expanded
 
 
 def _nosology_matches_question(nosology: str, question_terms: set[str]) -> bool:
-    """True if any significant nosology term appears in the question terms."""
+    """True if any significant nosology term overlaps with question terms.
+
+    Uses exact token matching after abbreviation expansion.
+    Deliberately avoids prefix/stem matching: "беременным" (question subject)
+    must NOT match "Фибрилляция предсердий у беременных" (coincidental modifier
+    in an unrelated guideline) — only the PRIMARY disease tokens matter.
+    """
     return bool(_tokenize_medical(nosology) & question_terms)
 
 
