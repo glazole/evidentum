@@ -425,7 +425,12 @@ def trigger_embed(document_id: int, background_tasks: BackgroundTasks) -> Trigge
 
 @router.post("/documents/{document_id}/enrich", response_model=TriggerResponse)
 def trigger_enrich(document_id: int, background_tasks: BackgroundTasks) -> TriggerResponse:
-    """Force-trigger LLM enrichment for a specific document (runs in background)."""
+    """Force-trigger LLM enrichment for a specific document (runs in background).
+
+    Passes only_missing=False so it retries even chunks that previously failed
+    (summary == '') and marks empty-text chunks with summary='' so they are
+    counted as processed and not retried forever.
+    """
     with session_scope() as session:
         doc = session.get(Document, document_id)
         if doc is None:
@@ -437,7 +442,8 @@ def trigger_enrich(document_id: int, background_tasks: BackgroundTasks) -> Trigg
         from app.services.llm import get_llm_client
         try:
             llm = get_llm_client()
-            stats = enrich_chunks(document_id, llm=llm)
+            # only_missing=False: retry all, including summary="" (error-marked) chunks
+            stats = enrich_chunks(document_id, only_missing=False, llm=llm)
             print(f"[trigger] enrich doc {document_id}: {stats}", file=__import__("sys").stderr)
             embed_chunks(document_id=document_id, only_missing=False)
             print(f"[trigger] re-embed after enrich doc {document_id}", file=__import__("sys").stderr)
@@ -449,7 +455,7 @@ def trigger_enrich(document_id: int, background_tasks: BackgroundTasks) -> Trigg
         document_id=document_id,
         stage="enrich",
         status="started",
-        message="LLM-обогащение запущено в фоне. Обновите статус через несколько минут.",
+        message="LLM-обогащение запущено в фоне (все фрагменты, включая ошибочные). Обновите статус через несколько минут.",
     )
 
 

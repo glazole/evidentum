@@ -105,6 +105,7 @@ def enrich_chunks(
                 text = (chunk.chunk_text or "").strip()
                 if not text:
                     stats.skipped += 1
+                    chunk.summary = ""  # mark processed so it is never retried
                     print(f"[enrich] {idx}/{total} chunk_id={chunk.id} SKIPPED (empty)", flush=True)
                     continue
                 try:

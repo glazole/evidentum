@@ -9,7 +9,6 @@ import streamlit as st
 
 API_BASE_URL = os.getenv("UI_API_BASE_URL", "http://localhost:8000/api")
 
-st.set_page_config(page_title="Аналитика — Evidentum", page_icon="📊", layout="wide")
 st.title("📊 Аналитика качества ответов")
 st.caption(
     "Метрики обновляются после каждого запроса. "
@@ -31,7 +30,7 @@ def load_metrics(limit: int = 100) -> dict[str, Any]:
 
 
 col_refresh, _ = st.columns([1, 9])
-if col_refresh.button("↻ Обновить", use_container_width=True):
+if col_refresh.button("↻ Обновить", width="stretch"):
     st.cache_data.clear()
     st.rerun()
 
