@@ -281,10 +281,12 @@ def embed_chunks(
 
             valid_pairs: list[tuple[Chunk, str]] = []
             for chunk in batch:
-                text = (chunk.chunk_text or "").strip()
-                if not text:
+                body = (chunk.chunk_text or "").strip()
+                if not body:
                     stats.skipped_chunks += 1
                     continue
+                summary = getattr(chunk, "summary", None) or ""
+                text = f"{summary}\n\n{body}" if summary else body
                 valid_pairs.append((chunk, text))
 
             if not valid_pairs:

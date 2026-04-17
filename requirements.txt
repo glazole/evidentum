@@ -1,4 +1,5 @@
 sqlalchemy>=2.0
+alembic>=1.13
 psycopg[binary]>=3.1
 pgvector>=0.3.0
 requests>=2.31
@@ -6,6 +7,13 @@ beautifulsoup4>=4.12
 pypdf>=4.2
 cryptography>=3.1
 openai
+
+# =========================
+# Optional LLM providers
+# =========================
+# Uncomment to enable Anthropic Claude support (LLM_PROVIDER=anthropic):
+# anthropic>=0.30
+
 # =========================
 # API
 # =========================
@@ -15,4 +23,4 @@ uvicorn[standard]==0.30.6
 # =========================
 # UI
 # =========================
-gradio==6.9.0
+streamlit>=1.35
