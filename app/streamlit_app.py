@@ -119,51 +119,26 @@ def display_name(item: dict) -> str:
 # ── Status section ────────────────────────────────────────────────────────────
 
 def render_status() -> None:
+    """Render indexing status as a compact list inside an expander at page bottom."""
     items = load_sources()
     if not items:
         st.warning("Не удалось загрузить список источников. API недоступен?")
         return
 
-    any_issues = False
     any_missing_emb = False
     any_not_enriched = False
 
-    cols = st.columns(max(len(items), 1))
-    for col, item in zip(cols, items):
+    # Summary banner
+    for item in items:
         total = item.get("chunk_count", 0)
         missing_emb = item.get("missing_embeddings", 0)
         enriched = item.get("enriched_chunks", 0)
-        embedded = total - missing_emb
-        name = display_name(item)
-
         if missing_emb > 0:
-            icon, delta_color = "🔴", "inverse"
-            status_val = f"{embedded}/{total}"
-            label_suffix = "эмбеддингов"
-            any_issues = True
             any_missing_emb = True
         elif enriched < total:
-            icon, delta_color = "🟡", "off"
-            status_val = f"{enriched}/{total}"
-            label_suffix = "обогащено"
-            any_issues = True
             any_not_enriched = True
-        else:
-            icon, delta_color = "🟢", "normal"
-            status_val = str(total)
-            label_suffix = "фрагментов"
 
-        col.metric(
-            label=f"{icon} {name[:28]}",
-            value=status_val,
-            delta=label_suffix,
-            delta_color=delta_color,
-            help=f"source_id: {item.get('source_id')}\n"
-                 f"Эмбеддинги: {embedded}/{total}\n"
-                 f"Обогащено: {enriched}/{total}",
-        )
-
-    c1, c2 = st.columns([6, 1])
+    c1, c2 = st.columns([7, 1])
     if any_missing_emb:
         c1.error(
             "🔴 Часть документов ещё не проиндексирована — поиск по ним недоступен. "
@@ -172,17 +147,42 @@ def render_status() -> None:
         )
     elif any_not_enriched:
         c1.warning(
-            "🟡 Обогащение фрагментов ещё не завершено. "
-            "Поиск работает, но **качество ответов и сравнений ниже**: "
-            "система использует сырой текст вместо LLM-дистиллята (summary). "
-            "Обогащение выполняется автоматически в фоне.",
+            "🟡 Обогащение не завершено. Поиск работает, но **качество ответов ниже**: "
+            "система использует сырой текст вместо LLM-дистиллята. "
+            "Обогащение выполняется в фоне автоматически.",
         )
     else:
         c1.success("Все документы полностью проиндексированы и обогащены.", icon="✅")
-
     if c2.button("↻ Обновить", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
+
+    st.markdown("---")
+
+    # Document list
+    for item in items:
+        total = item.get("chunk_count", 0)
+        missing_emb = item.get("missing_embeddings", 0)
+        enriched = item.get("enriched_chunks", 0)
+        embedded = total - missing_emb
+        name = display_name(item)
+        source_id_val = item.get("source_id") or "—"
+
+        if missing_emb > 0:
+            icon = "🔴"
+            status = f"эмбеддингов: {embedded}/{total}"
+        elif enriched < total:
+            icon = "🟡"
+            status = f"обогащено: {enriched}/{total} фрагментов"
+        else:
+            icon = "🟢"
+            status = f"{total} фрагментов"
+
+        st.markdown(
+            f"{icon} **{name}**  \n"
+            f"<span style='color:#888; font-size:0.8rem'>{source_id_val} · {status}</span>",
+            unsafe_allow_html=True,
+        )
 
 
 # ── Result renderers ──────────────────────────────────────────────────────────
@@ -342,16 +342,6 @@ def render_compare_result(data: dict) -> None:
 st.title("🏥 Evidentum")
 st.caption("Поиск по клиническим рекомендациям с генерацией структурированного ответа")
 
-# Status (collapsed by default once all green)
-items_now = load_sources()
-has_issues_now = any(
-    item.get("missing_embeddings", 0) > 0
-    or item.get("enriched_chunks", 0) < item.get("chunk_count", 0)
-    for item in items_now
-)
-with st.expander("📊 Статус индексации", expanded=has_issues_now):
-    render_status()
-
 st.divider()
 
 # ── Search form ───────────────────────────────────────────────────────────────
@@ -468,3 +458,8 @@ with right:
             "</div>",
             unsafe_allow_html=True,
         )
+
+# ── Indexing status (bottom, always collapsed) ────────────────────────────────
+st.divider()
+with st.expander("📊 Статус индексации документов", expanded=False):
+    render_status()
