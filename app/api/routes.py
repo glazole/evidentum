@@ -106,6 +106,14 @@ class CompareRequest(BaseModel):
         le=1.0,
         description="Sources with best chunk score >= this value bypass nosology filter.",
     )
+    source_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "If set and non-empty, only these guidelines are compared: score/nosology "
+            "filters are not applied, and each id gets a scoped retrieval if missing "
+            "from the global top-k. None or omitted = all guidelines with usual thresholds."
+        ),
+    )
 
 
 # ── Nosology/specialty metadata filter ─────────────────────────────────────────
@@ -393,11 +401,43 @@ def answer_route(payload: AnswerRequest, background_tasks: BackgroundTasks) -> d
         raise HTTPException(status_code=500, detail=f"Answer generation failed: {exc}") from exc
 
 
+def _group_hits_by_source_limit(hits: list[Any], *, max_per_source: int) -> dict[str, list[Any]]:
+    by_source: dict[str, list[Any]] = {}
+    for h in hits:
+        bucket = by_source.setdefault(h.source_id, [])
+        if len(bucket) < max_per_source:
+            bucket.append(h)
+    return by_source
+
+
+def _append_hits_deduped(
+    by_source: dict[str, list[Any]],
+    hits: list[Any],
+    *,
+    max_per_source: int,
+    only_sources: set[str],
+) -> None:
+    for h in hits:
+        sid = h.source_id
+        if sid not in only_sources:
+            continue
+        bucket = by_source.setdefault(sid, [])
+        existing = {x.chunk_id for x in bucket}
+        if h.chunk_id in existing:
+            continue
+        if len(bucket) >= max_per_source:
+            continue
+        bucket.append(h)
+
+
 @router.post("/compare")
 def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
     """
-    Semantic retrieval → group by source → drop sources below min_score →
-    LLM synthesis only over truly relevant guidelines.
+    Semantic retrieval → group by source → (optional) score/nosology filters →
+    LLM synthesis. If ``source_ids`` is set, those guidelines are compared
+    regardless of score: min_score and nosology filters are skipped, and each
+    selected source is backfilled with a scoped retrieval if missing from the
+    global top results.
     """
     import time as _time
     t0 = _time.time()
@@ -410,41 +450,71 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
             nosology=payload.nosology,
         )
 
-        hits = retrieval.hits
-        if not hits:
+        hits = list(retrieval.hits or [])
+        forced_ids: set[str] | None = set(payload.source_ids) if payload.source_ids else None
+        force_compare = bool(forced_ids)
+
+        if not hits and not force_compare:
             return {"question": payload.question, "sources": [], "comparison": "Фрагменты не найдены."}
 
-        # Group by source, keep top max_chunks_per_source per source
-        by_source: dict[str, list[Any]] = {}
-        for h in hits:
-            bucket = by_source.setdefault(h.source_id, [])
-            if len(bucket) < payload.max_chunks_per_source:
-                bucket.append(h)
+        by_source = _group_hits_by_source_limit(hits, max_per_source=payload.max_chunks_per_source)
 
-        # Filter out sources where best chunk score is below threshold
-        relevant_sources = {
-            src_id: src_hits
-            for src_id, src_hits in by_source.items()
-            if max(h.score for h in src_hits) >= payload.min_score
-        }
+        if forced_ids is not None:
+            by_source = {k: v for k, v in by_source.items() if k in forced_ids}
+            backfill_k = max(48, payload.top_k * 4, payload.max_chunks_per_source * 10)
+            for sid in forced_ids:
+                if by_source.get(sid):
+                    continue
+                sub = retrieve(
+                    payload.question,
+                    top_k=backfill_k,
+                    translate_mode=payload.translate_mode,
+                    specialty=payload.specialty,
+                    nosology=payload.nosology,
+                    source_id=sid,
+                )
+                _append_hits_deduped(
+                    by_source,
+                    list(sub.hits or []),
+                    max_per_source=payload.max_chunks_per_source,
+                    only_sources=forced_ids,
+                )
 
-        # Secondary nosology/specialty metadata filter
-        if payload.nosology_filter and relevant_sources:
-            relevant_sources = _apply_nosology_filter(
-                relevant_sources,
-                payload.question,
-                payload.nosology_bypass_score,
-            )
+        skipped_forced: set[str] = set()
+        if force_compare:
+            relevant_sources = {sid: by_source[sid] for sid in sorted(forced_ids) if by_source.get(sid)}
+            skipped_forced = (forced_ids or set()) - set(relevant_sources.keys())
+        else:
+            if not by_source:
+                return {"question": payload.question, "sources": [], "comparison": "Фрагменты не найдены."}
+            relevant_sources = {
+                src_id: src_hits
+                for src_id, src_hits in by_source.items()
+                if max(h.score for h in src_hits) >= payload.min_score
+            }
+            if payload.nosology_filter and relevant_sources:
+                relevant_sources = _apply_nosology_filter(
+                    relevant_sources,
+                    payload.question,
+                    payload.nosology_bypass_score,
+                )
 
         if not relevant_sources:
-            return {
-                "question": payload.question,
-                "sources": [],
-                "comparison": (
+            if force_compare:
+                detail = (
+                    "По выбранным гайдлайнам не найдено проиндексированных фрагментов. "
+                    f"Идентификаторы: {', '.join(sorted(forced_ids or []))}."
+                )
+            else:
+                detail = (
                     f"Ни один источник не набрал достаточного сходства "
                     f"(порог score={payload.min_score}). "
                     "Попробуйте переформулировать вопрос."
-                ),
+                )
+            return {
+                "question": payload.question,
+                "sources": [],
+                "comparison": detail,
             }
 
         # Flatten only relevant hits for synthesis
@@ -510,6 +580,13 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
 
         elapsed_ms = int((_time.time() - t0) * 1000)
         answer_text = structured.get("recommendation") or structured.get("consensus") or ""
+        if skipped_forced:
+            note = (
+                "\n\n[Нет фрагментов для сравнения: "
+                + ", ".join(sorted(skipped_forced))
+                + "]"
+            )
+            answer_text = answer_text + note
 
         from app.services.evaluator import _build_context_from_compare_sources, run_judge, save_query_log
         context_text = _build_context_from_compare_sources(source_rows)
@@ -525,6 +602,14 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
             run_judge, log_id, payload.question, answer_text, context_text,
         )
 
+        rec_out = structured.get("recommendation")
+        if skipped_forced:
+            rec_out = (rec_out or "") + (
+                "\n\n_Не удалось извлечь фрагменты для: "
+                + ", ".join(sorted(skipped_forced))
+                + "._"
+            )
+
         return {
             "question": payload.question,
             "effective_query": retrieval.effective_query,
@@ -532,7 +617,7 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
             "positions": structured.get("positions") or [],
             "consensus": structured.get("consensus"),
             "disagreements": structured.get("disagreements") or [],
-            "recommendation": structured.get("recommendation"),
+            "recommendation": rec_out,
             "log_id": log_id,
         }
 

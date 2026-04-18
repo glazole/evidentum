@@ -19,6 +19,9 @@ _DEFAULT_TRANSLATE_MODE = "dual_query"
 _DEFAULT_MIN_SCORE_COMPARE = 0.45
 _DEFAULT_NOSOLOGY_FILTER = True
 
+# Псевдо-опция «Все» в multiselect сравнения (не совпадает с реальными source_id)
+_COMPARE_ALL_SENTINEL = "__COMPARE_ALL__"
+
 st.markdown(
     """
     <style>
@@ -106,6 +109,7 @@ def api_compare(
     temperature: float,
     min_score: float = 0.45,
     nosology_filter: bool = True,
+    source_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "question": question,
@@ -116,6 +120,8 @@ def api_compare(
         "min_score": min_score,
         "nosology_filter": nosology_filter,
     }
+    if source_ids is not None:
+        payload["source_ids"] = source_ids
     r = requests.post(f"{API_BASE_URL}/compare", json=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
@@ -628,6 +634,14 @@ source_options: dict[str, str | None] = {"Все источники": None}
 for item in items:
     source_options[display_name(item)] = item.get("source_id")
 
+item_by_source_id: dict[str, dict] = {
+    str(i.get("source_id")): i for i in items if i.get("source_id")
+}
+sorted_source_ids_for_compare = sorted(
+    item_by_source_id.keys(),
+    key=lambda sid: display_name(item_by_source_id[sid]),
+)
+
 left, right = st.columns([2, 3], gap="large")
 
 with left:
@@ -651,13 +665,35 @@ with left:
         ),
     )
 
-    source_label = st.selectbox(
-        "Источник",
-        options=list(source_options.keys()),
-        disabled=(mode == "Сравнение гайдлайнов"),
-        help="В режиме «Сравнение» поиск идёт по всем источникам автоматически",
-    )
-    source_id = source_options[source_label]
+    source_id: str | None = None
+    if mode != "Сравнение гайдлайнов":
+        source_label = st.selectbox(
+            "Источник",
+            options=list(source_options.keys()),
+            help="Ограничить ответ одним гайдлайном или искать по всем.",
+        )
+        source_id = source_options[source_label]
+
+    selected_compare_source_ids: list[str] = []
+    if mode == "Сравнение гайдлайнов" and sorted_source_ids_for_compare:
+        _cmp_options = [_COMPARE_ALL_SENTINEL] + sorted_source_ids_for_compare
+
+        def _fmt_compare_option(opt: str) -> str:
+            if opt == _COMPARE_ALL_SENTINEL:
+                return "Все"
+            return display_name(item_by_source_id[opt])
+
+        selected_compare_source_ids = st.multiselect(
+            "Гайдлайны для сравнения",
+            options=_cmp_options,
+            default=[_COMPARE_ALL_SENTINEL],
+            format_func=_fmt_compare_option,
+            help=(
+                "По умолчанию — **Все** (как раньше: все гайдлайны). "
+                "Снимите «Все» и отметьте конкретные источники, чтобы сравнить только их."
+            ),
+            key="compare_guidelines_multiselect",
+        )
 
     if advanced_ui:
         col_m, col_t = st.columns(2)
@@ -741,16 +777,27 @@ with right:
                         )
                         st.session_state["result"] = ("answer", data)
                     else:
-                        data = api_compare(
-                            q,
-                            top_k=top_k,
-                            translate_mode=translate_mode,
-                            model=model,
-                            temperature=temperature,
-                            min_score=min_score,
-                            nosology_filter=nosology_filter,
-                        )
-                        st.session_state["result"] = ("compare", data)
+                        if not sorted_source_ids_for_compare:
+                            st.error("В системе нет гайдлайнов для сравнения.")
+                        elif not selected_compare_source_ids:
+                            st.error("Выберите «Все» или хотя бы один гайдлайн для сравнения.")
+                        else:
+                            compare_source_ids: list[str] | None
+                            if _COMPARE_ALL_SENTINEL in selected_compare_source_ids:
+                                compare_source_ids = None
+                            else:
+                                compare_source_ids = list(selected_compare_source_ids)
+                            data = api_compare(
+                                q,
+                                top_k=top_k,
+                                translate_mode=translate_mode,
+                                model=model,
+                                temperature=temperature,
+                                min_score=min_score,
+                                nosology_filter=nosology_filter,
+                                source_ids=compare_source_ids,
+                            )
+                            st.session_state["result"] = ("compare", data)
                     st.session_state["elapsed"] = time.time() - t0
                 except requests.HTTPError as exc:
                     st.error(f"Ошибка API ({exc.response.status_code}): {exc.response.text[:300]}")
