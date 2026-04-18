@@ -22,6 +22,7 @@ _DEFAULT_NOSOLOGY_FILTER = True
 # Псевдо-опция «Все» в multiselect сравнения (не совпадает с реальными source_id)
 _COMPARE_ALL_SENTINEL = "__COMPARE_ALL__"
 
+# Расширишл стили - сделал кнопки в цвет презентации 18.04.2026 19:35
 st.markdown(
     """
     <style>
@@ -40,12 +41,13 @@ st.markdown(
     .src-card-warn { border-left-color: #f0ad4e; }
     .src-card-ok   { border-left-color: #5cb85c; }
 
-    /* Добавил цвет кнопки - сделал как в презе */
+    /* Primary button */
     div.stButton > button {
         background-color: #059669 !important;
         border: 1px solid #059669 !important;
         color: white !important;
         border-radius: 8px;
+        padding: 0.5rem 1rem;
     }
 
     div.stButton > button:hover {
@@ -54,13 +56,33 @@ st.markdown(
         color: white !important;
     }
 
+    /* Slider — активная линия */
+    .stSlider > div > div > div > div {
+        background-color: #059669 !important;
+    }
+
+    /* Slider — кружок */
+    .stSlider [role="slider"] {
+        background-color: #059669 !important;
+        border: 2px solid #059669 !important;
+    }
+
+    /* Hover эффект кружка */
+    .stSlider [role="slider"]:hover {
+        box-shadow: 0 0 0 6px rgba(5, 150, 105, 0.2) !important;
+    }
+
+    /* Подписи и значения */
+    .stSlider span {
+        color: #059669 !important;
+    }
+
     /* Mute Streamlit default footer */
     footer { visibility: hidden; }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
