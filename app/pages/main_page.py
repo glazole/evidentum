@@ -56,27 +56,6 @@ st.markdown(
         color: white !important;
     }
 
-    /* Slider — активная линия */
-    .stSlider > div > div > div > div {
-        background-color: #059669 !important;
-    }
-
-    /* Slider — кружок */
-    .stSlider [role="slider"] {
-        background-color: #059669 !important;
-        border: 2px solid #059669 !important;
-    }
-
-    /* Hover эффект кружка */
-    .stSlider [role="slider"]:hover {
-        box-shadow: 0 0 0 6px rgba(5, 150, 105, 0.2) !important;
-    }
-
-    /* Подписи и значения */
-    .stSlider span {
-        color: #059669 !important;
-    }
-
     /* Mute Streamlit default footer */
     footer { visibility: hidden; }
     </style>
