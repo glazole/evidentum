@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 import streamlit as st
+import pandas as pd
+import altair as alt
 
 API_BASE_URL = os.getenv("UI_API_BASE_URL", "http://localhost:8000/api")
 
@@ -87,14 +89,77 @@ else:
         delta = f"{(val - 3):.2f}" if val is not None else None
         col.metric(label, val_str, delta=delta, help=help_text)
 
-    # Bar chart of average scores
-    chart_data = {
-        c[1]: [float(avg.get(c[0]) or 0)]
-        for c in criteria
-    }
-    import pandas as pd
-    df_chart = pd.DataFrame(chart_data)
-    st.bar_chart(df_chart, height=200, use_container_width=True)
+# ── Сбор данных ──────────────────────────────────────────────
+rows = [
+    {"Критерий": label, "Оценка": float(avg.get(key) or 0)}
+    for key, label, _ in criteria
+]
+df_chart = pd.DataFrame(rows)
+
+# ── Цвета для каждой метрики ──────────────────────────────────
+color_map = {
+    "Верность":        "#4C78A8",  # синий
+    "Релевантность":   "#E45756",  # красный
+    "Полнота":         "#72B7B2",  # голубой
+    "Согласованность": "#F58518",  # оранжевый
+}
+df_chart["Цвет"] = df_chart["Критерий"].map(color_map)
+
+# ── Altair: горизонтальный bar chart ─────────────────────────
+chart = (
+    alt.Chart(df_chart)
+    .mark_bar(cornerRadiusEnd=4)
+    .encode(
+        # Горизонтальная ось: оценка от 0 до 5
+        x=alt.X(
+            "Оценка:Q",
+            scale=alt.Scale(domain=[0, 5]),
+            axis=alt.Axis(title="Оценка (0–5)", grid=True, tickCount=6),
+        ),
+        # Вертикальная ось: названия метрик, сортировка фиксирована
+        y=alt.Y(
+            "Критерий:N",
+            sort=["Верность", "Релевантность", "Полнота", "Согласованность"],
+            axis=alt.Axis(title=None, labelFontSize=13),
+        ),
+        color=alt.Color(
+            "Критерий:N",
+            scale=alt.Scale(
+                domain=list(color_map.keys()),
+                range=list(color_map.values()),
+            ),
+            legend=None,  # подписи на оси — легенда лишняя
+        ),
+        tooltip=[
+            alt.Tooltip("Критерий:N", title="Метрика"),
+            alt.Tooltip("Оценка:Q", title="Оценка", format=".2f"),
+        ],
+    )
+    .properties(height=180)
+)
+
+# ── Линия-порог на 3.0 (нейтральный уровень) ─────────────────
+threshold = (
+    alt.Chart(pd.DataFrame({"x": [3]}))
+    .mark_rule(color="gray", strokeDash=[4, 4], opacity=0.6)
+    .encode(x="x:Q")
+)
+
+# ── Подпись значения на конце каждого бара ───────────────────
+text = (
+    alt.Chart(df_chart)
+    .mark_text(align="left", dx=4, fontSize=12, fontWeight="bold")
+    .encode(
+        x="Оценка:Q",
+        y=alt.Y(
+            "Критерий:N",
+            sort=["Верность", "Релевантность", "Полнота", "Согласованность"],
+        ),
+        text=alt.Text("Оценка:Q", format=".2f"),
+    )
+)
+
+st.altair_chart(chart + threshold + text, use_container_width=True)
 
 st.divider()
 
