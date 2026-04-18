@@ -11,6 +11,14 @@ import streamlit as st
 API_BASE_URL = os.getenv("UI_API_BASE_URL", "http://localhost:8000/api")
 REQUEST_TIMEOUT = int(os.getenv("UI_REQUEST_TIMEOUT", "180"))
 
+# Значения по умолчанию, когда «Гибкая настройка» выключена
+_DEFAULT_MODEL = "alice"
+_DEFAULT_TEMPERATURE = 0.2
+_DEFAULT_TOP_K = 6
+_DEFAULT_TRANSLATE_MODE = "dual_query"
+_DEFAULT_MIN_SCORE_COMPARE = 0.45
+_DEFAULT_NOSOLOGY_FILTER = True
+
 st.markdown(
     """
     <style>
@@ -152,11 +160,27 @@ def _api_delete_document(document_id: int) -> dict[str, Any]:
     return r.json()
 
 
-def render_status() -> None:
-    """Render indexing status with per-document progress bars and trigger buttons."""
+def _api_patch_document_name(document_id: int, source_name: str) -> dict[str, Any]:
+    """POST /api/documents/{id}/rename — обновить отображаемое название (source_name)."""
+    r = requests.post(
+        f"{API_BASE_URL}/documents/{document_id}/rename",
+        json={"source_name": source_name},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def render_status(*, advanced: bool) -> None:
+    """Список гайдлайнов: при advanced — полный статус и действия; иначе только названия."""
     items = load_sources()
     if not items:
         st.warning("Не удалось загрузить список источников. API недоступен?")
+        return
+
+    if not advanced:
+        for item in items:
+            st.markdown(f"- {display_name(item)}")
         return
 
     any_missing_emb = any(i.get("missing_embeddings", 0) > 0 for i in items)
@@ -212,8 +236,8 @@ def render_status() -> None:
             trigger_key = f"trig_{doc_id}"
             confirm_key = f"confirm_del_{doc_id}"
 
-            # Header row: icon + name + source_id + delete button
-            hdr, btn_col, del_col = st.columns([5, 2, 1])
+            # Header row: icon + name + source_id + action buttons + delete
+            hdr, btn_col, del_col = st.columns([4.2, 3.8, 0.75])
             hdr.markdown(
                 f"{icon} **{name}**  "
                 f"<span style='color:#888; font-size:0.78rem'>&nbsp;{source_id_val}"
@@ -223,7 +247,7 @@ def render_status() -> None:
 
             # Action buttons (inline, right-aligned)
             with btn_col:
-                b1, b2, b3 = st.columns(3)
+                b1, b2, b3, b4 = st.columns(4)
 
                 if b1.button(
                     "▶ Embed",
@@ -264,6 +288,16 @@ def render_status() -> None:
                     except Exception as e:
                         st.session_state[trigger_key] = f"Ошибка: {e}"
 
+                if b4.button(
+                    "✏️",
+                    key=f"rename_{doc_id}",
+                    help="Переименовать отображаемое название вручную",
+                    width="stretch",
+                ):
+                    st.session_state["rename_active"] = doc_id
+                    st.session_state[f"ti_rename_{doc_id}"] = (item.get("source_name") or "").strip()
+                    st.rerun()
+
             # Delete button — one click to arm, second click to confirm
             with del_col:
                 if not st.session_state.get(confirm_key):
@@ -284,6 +318,9 @@ def render_status() -> None:
                             resp = _api_delete_document(doc_id)
                             st.session_state.pop(confirm_key, None)
                             st.session_state.pop(trigger_key, None)
+                            if st.session_state.get("rename_active") == doc_id:
+                                st.session_state.pop("rename_active", None)
+                                st.session_state.pop(f"ti_rename_{doc_id}", None)
                             st.success(resp.get("message", "Удалено"))
                             st.cache_data.clear()
                             st.rerun()
@@ -293,6 +330,32 @@ def render_status() -> None:
                     if cc2.button("❌", key=f"del_no_{doc_id}", help="Отмена", width="stretch"):
                         st.session_state.pop(confirm_key, None)
                         st.rerun()
+
+            if st.session_state.get("rename_active") == doc_id:
+                st.text_input(
+                    "Отображаемое название",
+                    key=f"ti_rename_{doc_id}",
+                    max_chars=256,
+                )
+                rs1, rs2, _ = st.columns([1, 1, 4])
+                if rs1.button("Сохранить", key=f"rename_save_{doc_id}", type="primary"):
+                    raw = (st.session_state.get(f"ti_rename_{doc_id}") or "").strip()
+                    if not raw:
+                        st.session_state[trigger_key] = "Введите непустое название."
+                    else:
+                        try:
+                            _api_patch_document_name(doc_id, raw)
+                            st.session_state.pop("rename_active", None)
+                            st.session_state.pop(f"ti_rename_{doc_id}", None)
+                            st.session_state[trigger_key] = "Название сохранено."
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.session_state[trigger_key] = f"Ошибка: {e}"
+                if rs2.button("Отмена", key=f"rename_cancel_{doc_id}"):
+                    st.session_state.pop("rename_active", None)
+                    st.session_state.pop(f"ti_rename_{doc_id}", None)
+                    st.rerun()
 
             # Show last trigger message if any
             if st.session_state.get(trigger_key):
@@ -522,39 +585,42 @@ st.caption("Поиск по клиническим рекомендациям с
 
 st.divider()
 
-# ── Upload section ────────────────────────────────────────────────────────────
-with st.expander("📤 Загрузить гайдлайн", expanded=False):
-    st.markdown(
-        "Загрузите PDF-файл клинической рекомендации. После загрузки система автоматически:\n"
-        "1. Разобьёт документ на фрагменты и построит эмбеддинги (~30 сек) — документ появится в поиске\n"
-        "2. Обогатит фрагменты через LLM: summary, нозология, специальность (несколько минут в фоне)\n\n"
-        "Прогресс отображается в блоке **«Статус индексации»** внизу страницы."
-    )
-    uploaded_file = st.file_uploader(
-        "Выберите PDF-файл",
-        type=["pdf"],
-        key="guideline_upload",
-        label_visibility="collapsed",
-    )
-    if uploaded_file is not None:
-        if st.button("⬆️ Загрузить на сервер", type="primary"):
-            with st.spinner(f"Загрузка «{uploaded_file.name}»…"):
-                try:
-                    result = api_upload(uploaded_file.getvalue(), uploaded_file.name)
-                    st.success(
-                        f"✅ **{uploaded_file.name}** принят.\n\n"
-                        f"{result.get('message', '')}"
-                    )
-                    st.cache_data.clear()
-                except requests.HTTPError as exc:
-                    code = exc.response.status_code
-                    detail = exc.response.json().get("detail", exc.response.text[:200])
-                    if code == 409:
-                        st.warning(f"⚠️ {detail}")
-                    else:
-                        st.error(f"Ошибка загрузки ({code}): {detail}")
-                except Exception as exc:
-                    st.error(f"Ошибка: {exc}")
+advanced_ui = bool(st.session_state.get("advanced_ui"))
+
+# ── Upload section (только при гибкой настройке) ───────────────────────────────
+if advanced_ui:
+    with st.expander("📤 Загрузить гайдлайн", expanded=False):
+        st.markdown(
+            "Загрузите PDF-файл клинической рекомендации. После загрузки система автоматически:\n"
+            "1. Разобьёт документ на фрагменты и построит эмбеддинги (~30 сек) — документ появится в поиске\n"
+            "2. Обогатит фрагменты через LLM: summary, нозология, специальность (несколько минут в фоне)\n\n"
+            "Прогресс отображается в блоке **«Используемые гайдлайны»** внизу страницы."
+        )
+        uploaded_file = st.file_uploader(
+            "Выберите PDF-файл",
+            type=["pdf"],
+            key="guideline_upload",
+            label_visibility="collapsed",
+        )
+        if uploaded_file is not None:
+            if st.button("⬆️ Загрузить на сервер", type="primary"):
+                with st.spinner(f"Загрузка «{uploaded_file.name}»…"):
+                    try:
+                        result = api_upload(uploaded_file.getvalue(), uploaded_file.name)
+                        st.success(
+                            f"✅ **{uploaded_file.name}** принят.\n\n"
+                            f"{result.get('message', '')}"
+                        )
+                        st.cache_data.clear()
+                    except requests.HTTPError as exc:
+                        code = exc.response.status_code
+                        detail = exc.response.json().get("detail", exc.response.text[:200])
+                        if code == 409:
+                            st.warning(f"⚠️ {detail}")
+                        else:
+                            st.error(f"Ошибка загрузки ({code}): {detail}")
+                    except Exception as exc:
+                        st.error(f"Ошибка: {exc}")
 
 # ── Search form ───────────────────────────────────────────────────────────────
 items = load_sources()
@@ -593,52 +659,64 @@ with left:
     )
     source_id = source_options[source_label]
 
-    col_m, col_t = st.columns(2)
-    with col_m:
-        model = st.selectbox(
-            "Модель",
-            options=["alice", "yandex"],
-            help="alice = AliceAI-LLM (быстрее), yandex = YandexGPT 5.1 (точнее)",
-        )
-    with col_t:
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.2, step=0.05)
+    if advanced_ui:
+        col_m, col_t = st.columns(2)
+        with col_m:
+            model = st.selectbox(
+                "Модель",
+                options=["alice", "yandex"],
+                help="alice = AliceAI-LLM (быстрее), yandex = YandexGPT 5.1 (точнее)",
+            )
+        with col_t:
+            temperature = st.slider("Temperature", 0.0, 1.0, 0.2, step=0.05)
 
-    col_k, col_tr = st.columns(2)
-    with col_k:
-        top_k = st.slider("Top-K фрагментов", 3, 15, 6, step=1)
-    with col_tr:
-        translate_mode = st.selectbox(
-            "Перевод запроса",
-            options=["dual_query", "off", "query", "query_and_hits"],
-            help=(
-                "dual_query — поиск и по русскому, и по переведённому запросу (рекомендуется)"
-            ),
-        )
-
-    if mode == "Сравнение гайдлайнов":
-        col_ms, col_nf = st.columns(2)
-        with col_ms:
-            min_score = st.slider(
-                "Мин. релевантность",
-                0.10, 0.90, 0.45, step=0.01,
+        col_k, col_tr = st.columns(2)
+        with col_k:
+            top_k = st.slider("Top-K фрагментов", 3, 15, 6, step=1)
+        with col_tr:
+            translate_mode = st.selectbox(
+                "Перевод запроса",
+                options=["dual_query", "off", "query", "query_and_hits"],
                 help=(
-                    "Источники с лучшим score ниже порога исключаются из сравнения. "
-                    "Рекомендуемый диапазон: 0.50–0.65."
+                    "dual_query — поиск и по русскому, и по переведённому запросу (рекомендуется)"
                 ),
             )
-        with col_nf:
-            nosology_filter = st.checkbox(
-                "Фильтр по нозологии",
-                value=True,
-                help=(
-                    "Исключать источники, чьи LLM-обогащённые фрагменты "
-                    "содержат нозологию/специальность, не пересекающуюся с темой вопроса. "
-                    "Работает только для обогащённых документов."
-                ),
-            )
+
+        if mode == "Сравнение гайдлайнов":
+            col_ms, col_nf = st.columns(2)
+            with col_ms:
+                min_score = st.slider(
+                    "Мин. релевантность",
+                    0.10, 0.90, 0.45, step=0.01,
+                    help=(
+                        "Источники с лучшим score ниже порога исключаются из сравнения. "
+                        "Рекомендуемый диапазон: 0.50–0.65."
+                    ),
+                )
+            with col_nf:
+                nosology_filter = st.checkbox(
+                    "Фильтр по нозологии",
+                    value=True,
+                    help=(
+                        "Исключать источники, чьи LLM-обогащённые фрагменты "
+                        "содержат нозологию/специальность, не пересекающуюся с темой вопроса. "
+                        "Работает только для обогащённых документов."
+                    ),
+                )
+        else:
+            min_score = 0.55
+            nosology_filter = False
     else:
-        min_score = 0.55
-        nosology_filter = False
+        model = _DEFAULT_MODEL
+        temperature = _DEFAULT_TEMPERATURE
+        top_k = _DEFAULT_TOP_K
+        translate_mode = _DEFAULT_TRANSLATE_MODE
+        if mode == "Сравнение гайдлайнов":
+            min_score = _DEFAULT_MIN_SCORE_COMPARE
+            nosology_filter = _DEFAULT_NOSOLOGY_FILTER
+        else:
+            min_score = 0.55
+            nosology_filter = False
 
     search_btn = st.button("🔍 Найти", type="primary", width="stretch")
 
@@ -700,5 +778,5 @@ with right:
 
 # ── Indexing status (bottom, always collapsed) ────────────────────────────────
 st.divider()
-with st.expander("📊 Статус индексации документов", expanded=False):
-    render_status()
+with st.expander("📋 Используемые гайдлайны", expanded=False):
+    render_status(advanced=advanced_ui)

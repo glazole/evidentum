@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 import sys
 import threading
 from pathlib import Path
+
+from sqlalchemy import func, select
 
 DATA_RAW_DIR = Path("/app/data/raw")
 
@@ -10,6 +13,11 @@ DATA_RAW_DIR = Path("/app/data/raw")
 def _fmt_source_id(source_id: str) -> str:
     """Turn 'kr_rf_af_2024' into something like 'КР РФ ФП 2024'."""
     return source_id.replace("_", " ").upper()
+
+
+def _norm_slug(value: str) -> str:
+    """Compare LLM output to source_id without spaces/underscore noise."""
+    return re.sub(r"[^a-zа-яё0-9]+", "", (value or "").lower())
 
 
 def _is_boring_title(title: str | None) -> bool:
@@ -27,52 +35,163 @@ def _is_boring_title(title: str | None) -> bool:
     return False
 
 
-def _generate_title(document_id: int) -> None:
-    """Use LLM to generate a human-readable display title for a document."""
+def _llm_title_unacceptable(candidate: str | None, source_id: str) -> bool:
+    """True if the model echoed the slug or returned another non-human label."""
+    if not candidate or not str(candidate).strip():
+        return True
+    c = str(candidate).strip()
+    if _norm_slug(c) == _norm_slug(source_id):
+        return True
+    return _is_boring_title(c)
+
+
+def _build_title_context(session, document_id: int, doc) -> str:
+    """Rich text for naming: PDF title, year, document summary, chunks from several positions."""
+    from app.models import Chunk
+
+    parts: list[str] = []
+    if (doc.title or "").strip():
+        parts.append(f"Заголовок/первая строка из PDF: {doc.title.strip()}")
+    if doc.year:
+        parts.append(f"Год (эвристика): {doc.year}")
+    if (doc.region or "").strip():
+        parts.append(f"Регион: {doc.region}")
+    if (doc.nosology_primary or "").strip():
+        parts.append(f"Нозология (метаданные): {doc.nosology_primary}")
+    if (doc.summary_ru or "").strip():
+        parts.append(f"Резюме документа (если есть):\n{(doc.summary_ru or '')[:2800]}")
+
+    n_chunks = session.scalar(
+        select(func.count(Chunk.id)).where(Chunk.document_id == document_id)
+    ) or 0
+    if n_chunks == 0 and (doc.raw_text or "").strip():
+        parts.append(f"Начало текста документа:\n{(doc.raw_text or '')[:3500]}")
+        return "\n\n".join(parts)
+
+    raw_indices = [0, 1, 2, n_chunks // 6, n_chunks // 3, n_chunks // 2, n_chunks - 1]
+    idx_set: set[int] = set()
+    for i in raw_indices:
+        if n_chunks <= 0:
+            break
+        idx_set.add(max(0, min(n_chunks - 1, i)))
+    indices = sorted(idx_set)
+
+    chunks = list(
+        session.scalars(
+            select(Chunk)
+            .where(Chunk.document_id == document_id, Chunk.chunk_index.in_(indices))
+            .order_by(Chunk.chunk_index)
+        ).all()
+    )
+
+    frag_parts: list[str] = []
+    for ch in chunks:
+        sec = (ch.section_title or "").strip()
+        summ = (ch.summary or "").strip()
+        body = summ if summ else (ch.chunk_text or "")
+        body = body.strip()
+        if not body:
+            continue
+        head = f"--- Фрагмент #{ch.chunk_index}"
+        if sec:
+            head += f" ({sec})"
+        frag_parts.append(f"{head}\n{body[:900]}")
+
+    if frag_parts:
+        parts.append("Фрагменты из разных частей документа (после обогащения — с краткими резюме):\n" + "\n\n".join(frag_parts))
+
+    return "\n\n".join(parts)
+
+
+def _pick_fallback_display_name(doc) -> str:
+    """When LLM returns only a slug, use PDF title, first body line, or spaced source_id."""
+    t = (doc.title or "").strip()
+    if t and not _is_boring_title(t):
+        return t[:256]
+    raw = (doc.raw_text or "").strip()
+    if raw:
+        # First substantial line from body (skip very short / TOC-like)
+        for line in raw.splitlines():
+            s = line.strip()
+            if len(s) >= 24 and s.lower() not in {"оглавление", "содержание"}:
+                return s[:256]
+    return _fmt_source_id(doc.source_id)[:256]
+
+
+def _generate_title(document_id: int, *, force: bool = False) -> None:
+    """Use LLM to generate a human-readable display title for a document.
+
+    When *force* is False, skips documents whose source_name already looks
+    informative (slug-only filenames, generic TOC lines, etc.). Upload and the
+    «Title» API use force=True so typical «Download (1).pdf» stems with spaces
+    still get a proper guideline-style name.
+    """
     try:
-        from sqlalchemy import select
         from app.db import session_scope
-        from app.models import Chunk, Document
+        from app.models import Document
         from app.services.llm import get_llm_client
 
         with session_scope() as s:
             doc = s.get(Document, document_id)
             if doc is None:
                 return
-            if not _is_boring_title(doc.source_name):
+            if not force and not _is_boring_title(doc.source_name):
                 return
-
-            samples = s.scalars(
-                select(Chunk.chunk_text)
-                .where(Chunk.document_id == document_id)
-                .order_by(Chunk.chunk_index)
-                .limit(5)
-            ).all()
-            context = "\n\n".join(samples[:3])[:2000]
+            context = _build_title_context(s, document_id, doc)
 
         llm = get_llm_client()
-        prompt = (
-            f"source_id: {doc.source_id}\n\n"
-            f"Первые фрагменты документа:\n{context}\n\n"
-            "Определи читаемое название медицинского гайдлайна (организация, год, нозология) "
-            "и верни одну строку на русском языке, например: "
-            "'ESC 2024: Фибрилляция предсердий' или 'КР МЗ РФ 2024: Фибрилляция предсердий'. "
-            "Только название, без пояснений. "
-            "Если из текста нельзя уверенно определить организацию или год — не выдумывай их; "
-            f"верни нейтральное название нозологии или исходный идентификатор: {doc.source_id!r}."
+        sid = doc.source_id
+        base_user = (
+            f"Технический идентификатор в системе (НЕ используй его как ответ): {sid!r}\n\n"
+            f"{context}\n\n"
+            "Придумай ОДНУ строку — отображаемое название источника для списка клинических гайдлайнов на русском.\n"
+            "Формат по возможности: «организация или тип документа, год (если он явно есть в тексте выше): нозология».\n"
+            "Требования:\n"
+            "- ответ не должен совпадать с техническим идентификатором и не должен быть только латиницей/цифрами/slug;\n"
+            "- в ответе должны быть обычные русские слова (тема, орган, диагноз, «клинические рекомендации» и т.д.);\n"
+            "- не выдумывай год или организацию, если их нет в материале выше;\n"
+            "- тогда опиши тему нейтрально по смыслу текста (например: «Клинические рекомендации: …»).\n"
+            "Только одна строка названия, без кавычек и пояснений."
         )
         title = llm.complete(
-            [{"role": "user", "content": prompt}],
-            max_tokens=80,
-            temperature=0.1,
+            [{"role": "user", "content": base_user}],
+            max_tokens=120,
+            temperature=0.15,
         ).strip().strip('"').strip("'")
 
-        if title:
+        if _llm_title_unacceptable(title, sid):
+            retry_user = (
+                f"Технический идентификатор (запрещено повторять как ответ): {sid!r}\n\n"
+                f"{context[:12000]}\n\n"
+                "Предыдущая попытка вернула бесполезный ярлык. Сформулируй заново: короткое (до 120 символов) "
+                "читаемое название на русском для каталога гайдлайнов. Опирайся на «Заголовок/первая строка из PDF» "
+                "и фрагменты. Нельзя отвечать slug'ом или только номером документа. Одна строка, без кавычек."
+            )
+            title = llm.complete(
+                [{"role": "user", "content": retry_user}],
+                max_tokens=120,
+                temperature=0.25,
+            ).strip().strip('"').strip("'")
+
+        if _llm_title_unacceptable(title, sid):
             with session_scope() as s:
-                doc = s.get(Document, document_id)
-                if doc:
-                    doc.source_name = title[:256]
-            print(f"[autoprocess] generated title for doc {document_id}: {title!r}", file=sys.stderr)
+                doc2 = s.get(Document, document_id)
+                if doc2 is None:
+                    return
+                fallback = _pick_fallback_display_name(doc2)
+                if fallback:
+                    doc2.source_name = fallback
+                    print(
+                        f"[autoprocess] title fallback (no good LLM line) doc {document_id}: {fallback!r}",
+                        file=sys.stderr,
+                    )
+                return
+
+        with session_scope() as s:
+            doc3 = s.get(Document, document_id)
+            if doc3:
+                doc3.source_name = title[:256]
+        print(f"[autoprocess] generated title for doc {document_id}: {title!r}", file=sys.stderr)
     except Exception as exc:
         print(f"[autoprocess] title gen error doc {document_id}: {exc}", file=sys.stderr)
 
@@ -99,7 +218,7 @@ def process_single_file(file_path: str) -> dict:
         print(f"[autoprocess] embed error for {file_path}: {exc}", file=sys.stderr)
 
     # Synchronous: generate readable title (fast single LLM call)
-    _generate_title(document_id)
+    _generate_title(document_id, force=True)
 
     # Async: enrichment is slow — run in background thread
     def _enrich() -> None:
@@ -163,7 +282,6 @@ def run_autoprocess(data_dir: Path = DATA_RAW_DIR) -> None:
 
     # ── 3. Generate titles for boring names ───────────────────────────────────
     for doc in list_documents():
-        from sqlalchemy import select
         from app.db import session_scope
         from app.models import Document
 

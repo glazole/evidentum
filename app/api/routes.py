@@ -619,14 +619,7 @@ def trigger_title(document_id: int, background_tasks: BackgroundTasks) -> Trigge
     def _title() -> None:
         from app.services.autoprocess import _generate_title
         try:
-            # Temporarily bypass boring-title guard so user can force regeneration
-            from app.db import session_scope as _ss
-            from app.models import Document as _Doc
-            with _ss() as s:
-                d = s.get(_Doc, document_id)
-                if d:
-                    d.source_name = d.source_id  # reset to slug so _generate_title runs
-            _generate_title(document_id)
+            _generate_title(document_id, force=True)
         except Exception as exc:
             print(f"[trigger] title error doc {document_id}: {exc}", file=__import__("sys").stderr)
 
@@ -719,6 +712,47 @@ def get_document_summary(document_id: int) -> DocumentSummaryResponse:
         )
 
 
+class PatchDocumentBody(BaseModel):
+    source_name: str = Field(..., min_length=1, max_length=256)
+
+
+class PatchDocumentResponse(BaseModel):
+    document_id: int
+    source_name: str
+    message: str
+
+
+def _update_document_source_name(document_id: int, body: PatchDocumentBody) -> PatchDocumentResponse:
+    """Shared handler for PATCH and POST rename."""
+    name = (body.source_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Укажите непустое название.")
+    if len(name) > 256:
+        raise HTTPException(status_code=400, detail="Название не длиннее 256 символов.")
+    with session_scope() as session:
+        doc = session.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+        doc.source_name = name
+    return PatchDocumentResponse(
+        document_id=document_id,
+        source_name=name,
+        message="Название обновлено.",
+    )
+
+
+@router.patch("/documents/{document_id}", response_model=PatchDocumentResponse)
+def patch_document(document_id: int, body: PatchDocumentBody) -> PatchDocumentResponse:
+    """Update human-readable display name (`source_name`) for a document."""
+    return _update_document_source_name(document_id, body)
+
+
+@router.post("/documents/{document_id}/rename", response_model=PatchDocumentResponse)
+def rename_document(document_id: int, body: PatchDocumentBody) -> PatchDocumentResponse:
+    """Same as PATCH /documents/{id} — POST for proxies / clients that disallow PATCH."""
+    return _update_document_source_name(document_id, body)
+
+
 class UploadResponse(BaseModel):
     filename: str
     status: str          # "ingested" | "already_exists"
@@ -771,7 +805,7 @@ async def upload_document(
         message=(
             "Файл принят. Идексация запущена в фоне: "
             "эмбеддинги готовы через ~30 сек, LLM-обогащение — через несколько минут. "
-            "Статус появится в блоке «Статус индексации» внизу страницы."
+            "Статус появится в блоке «Используемые гайдлайны» внизу страницы."
         ),
     )
 
