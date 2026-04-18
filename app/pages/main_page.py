@@ -27,6 +27,7 @@ st.markdown(
     <style>
     /* Compact header */
     .block-container { padding-top: 1.5rem; }
+
     /* Source cards */
     .src-card {
         background: #f4f6f9;
@@ -38,6 +39,21 @@ st.markdown(
     }
     .src-card-warn { border-left-color: #f0ad4e; }
     .src-card-ok   { border-left-color: #5cb85c; }
+
+    /* Добавил цвет кнопки - сделал как в презе */
+    div.stButton > button {
+        background-color: #059669 !important;
+        border: 1px solid #059669 !important;
+        color: white !important;
+        border-radius: 8px;
+    }
+
+    div.stButton > button:hover {
+        background-color: #047857 !important;
+        border-color: #047857 !important;
+        color: white !important;
+    }
+
     /* Mute Streamlit default footer */
     footer { visibility: hidden; }
     </style>

@@ -264,20 +264,8 @@ _items = load_sources()
 _source_choices = build_source_choices(_items)
 _status_md = build_status_markdown(_items)
 
-# Добавил цвет кнопки
 with gr.Blocks(
-    title="Evidentum",
-    css="""
-    button.primary {
-        background-color: #059669 !important;
-        border-color: #059669 !important;
-    }
-    button.primary:hover {
-        background-color: #047857 !important;
-        border-color: #047857 !important;
-    }
-    """
-) as demo:
+    title="Evidentum") as demo:
     gr.Markdown(
         """
 # Evidentum
