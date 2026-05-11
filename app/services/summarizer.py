@@ -98,7 +98,10 @@ def generate_document_summary(
 
         try:
             summary_ru = llm.complete(
-                [{"role": "system", "text": SUMMARIZE_SYSTEM_PROMPT}, {"role": "user", "text": prompt}]
+                [
+                    {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ]
             )
             doc.summary_ru = summary_ru
         except Exception as exc:
@@ -119,8 +122,8 @@ def generate_document_summary(
                 try:
                     delta = llm.complete(
                         [
-                            {"role": "system", "text": SUMMARIZE_SYSTEM_PROMPT},
-                            {"role": "user", "text": delta_prompt},
+                            {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
+                            {"role": "user", "content": delta_prompt},
                         ]
                     )
                     doc.version_delta_ru = delta

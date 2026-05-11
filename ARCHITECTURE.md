@@ -66,7 +66,7 @@ chunks
   section_title   TEXT
   chunk_text      TEXT
   char_count      INTEGER
-  embedding       vector(256)    -- pgvector, индекс ivfflat/cosine
+  embedding       vector(256)    -- pgvector, HNSW/cosine индекс
   -- LLM-обогащение на уровне фрагмента
   summary         TEXT           -- 2-3 предложения от YandexGPT
   nosology        VARCHAR(256)   -- "Фибрилляция предсердий I48"
@@ -75,7 +75,8 @@ chunks
   evidence_level  VARCHAR(32)    -- "1A" | "2B" | null
 ```
 
-Индексы: `ix_chunks_nosology`, `ix_chunks_specialty`, pgvector-индекс на `embedding`.
+Индексы: `ix_chunks_nosology`, `ix_chunks_specialty`, `ix_documents_region`,
+`ix_documents_year`, HNSW/cosine pgvector-индекс на `chunks.embedding`.
 
 ---
 
@@ -523,10 +524,15 @@ networks:
 ```
 alembic/versions/
 ├── 20260414_0001_initial.py        # documents + chunks + embeddings
-└── 20260417_0003_llm_enrichment.py # summary/nosology/topic/... на chunks и documents
+├── 20260417_0003_llm_enrichment.py # summary/nosology/topic/... на chunks и documents
+├── 20260418_0004_query_logs.py     # журнал запросов, оценки и feedback
+└── 20260511_0005_retrieval_indexes.py # HNSW + фильтры documents.region/year
 ```
 
-Применение: `docker exec mvp_api alembic upgrade head`
+Применение вручную: `docker exec mvp_api alembic upgrade head`
+
+В Docker Compose API запускает `alembic upgrade head` перед `uvicorn`, поэтому схема
+обновляется до старта приложения.
 
 ---
 
