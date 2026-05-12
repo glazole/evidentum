@@ -143,6 +143,9 @@ PDF / HTML файл
   ┌─────┴──────────────────────────────┐
   │           Два прохода              │
   │                                    │
+  │  Query decomposition              │
+  │  сложный вопрос → 1..4 подзапроса │
+  │                                    │
   │  Проход 1: RU-запрос              │
   │  query_ru → Yandex Embeddings     │
   │  (text-search-query/latest)       │
@@ -157,6 +160,10 @@ PDF / HTML файл
   │  → vector(256)                    │
   │  → pgvector cosine_distance()     │
   │  → top-K*4 кандидатов             │
+  │                                    │
+  │  Проход 3: Postgres FTS            │
+  │  websearch_to_tsquery(simple)      │
+  │  → GIN индекс ix_chunks_fts_simple │
   └─────┬──────────────────────────────┘
         │
         ▼  merge_and_rerank_hits()
@@ -167,13 +174,17 @@ PDF / HTML файл
   │     (берём лучший из двух проходов)     │
   │                                         │
   │  2. Переосчёт score:                    │
-  │     base = 1.0 - cosine_distance        │
+  │     base = dense_score + fts_score      │
   │     + region_bonus   (RU +0.05)         │
   │     + section_bonus  ("лечение" +0.04,  │
   │                       "оглавление" -0.08)│
   │     + lexical_overlap (+0..+0.08)       │
+  │     + phrase/multi-signal bonuses       │
   │                                         │
-  │  3. Ограничение: max 2 чанка/документ   │
+  │  3. Section context: соседние чанки     │
+  │     из того же раздела для grounding    │
+  │                                         │
+  │  4. Ограничение: max 2 чанка/документ   │
   │     (для режима "Ответ")                │
   └─────┬───────────────────────────────────┘
         │  top-K hits
@@ -526,7 +537,8 @@ alembic/versions/
 ├── 20260414_0001_initial.py        # documents + chunks + embeddings
 ├── 20260417_0003_llm_enrichment.py # summary/nosology/topic/... на chunks и documents
 ├── 20260418_0004_query_logs.py     # журнал запросов, оценки и feedback
-└── 20260511_0005_retrieval_indexes.py # HNSW + фильтры documents.region/year
+├── 20260511_0005_retrieval_indexes.py # HNSW + фильтры documents.region/year
+└── 20260512_0006_hybrid_fts_index.py  # GIN FTS индекс для hybrid retrieval
 ```
 
 Применение вручную: `docker exec mvp_api alembic upgrade head`

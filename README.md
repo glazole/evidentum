@@ -93,6 +93,8 @@ UI_ADMIN_API_TOKEN=change-me           # опционально, если UI д�
 CORS_ALLOW_ORIGINS=http://localhost:7860
 UPLOAD_MAX_BYTES=26214400              # лимит загрузки PDF/HTML, по умолчанию 25 МБ
 DATA_RAW_DIR=/app/data/raw
+RETRIEVER_MODE=hybrid                  # hybrid = dense vectors + Postgres FTS
+RETRIEVER_QUERY_DECOMPOSITION=1        # разбивать сложный вопрос на подзапросы
 ```
 
 Если `ADMIN_API_TOKEN` не задан, административные API-ручки возвращают `503`, чтобы случайно не оставить загрузку и удаление документов открытыми.

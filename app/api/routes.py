@@ -20,6 +20,7 @@ AdminTokenHeader = Annotated[str | None, Header(alias="X-Admin-Token")]
 
 
 TranslateMode = Literal["off", "query", "query_and_hits", "dual_query"]
+RetrievalMode = Literal["vector", "hybrid"]
 
 
 def require_admin_token(x_admin_token: AdminTokenHeader = None) -> None:
@@ -122,6 +123,7 @@ class CatalogResponse(BaseModel):
 class RetrieveRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=6, ge=1, le=20)
+    retrieval_mode: RetrievalMode = "hybrid"
     translate_mode: TranslateMode = "dual_query"
     document_id: int | None = None
     source_id: str | None = None
@@ -135,6 +137,7 @@ class RetrieveRequest(BaseModel):
 class AnswerRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=6, ge=1, le=20)
+    retrieval_mode: RetrievalMode = "hybrid"
     translate_mode: TranslateMode = "dual_query"
     model: str = "alice"
     temperature: float = Field(default=0.2, ge=0.0, le=1.5)
@@ -150,6 +153,7 @@ class AnswerRequest(BaseModel):
 class CompareRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=12, ge=1, le=30)
+    retrieval_mode: RetrievalMode = "hybrid"
     translate_mode: TranslateMode = "dual_query"
     model: str = "alice"
     temperature: float = Field(default=0.2, ge=0.0, le=1.5)
@@ -410,6 +414,7 @@ def retrieve_route(payload: RetrieveRequest) -> dict[str, Any]:
         result = retrieve(
             payload.question,
             top_k=payload.top_k,
+            retrieval_mode=payload.retrieval_mode,
             document_id=payload.document_id,
             source_id=payload.source_id,
             region=payload.region,
@@ -432,6 +437,7 @@ def answer_route(payload: AnswerRequest, background_tasks: BackgroundTasks) -> d
         result = answer_question(
             payload.question,
             top_k=payload.top_k,
+            retrieval_mode=payload.retrieval_mode,
             translate_mode=payload.translate_mode,
             model_family=payload.model,
             temperature=payload.temperature,
@@ -512,6 +518,7 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
         retrieval = retrieve(
             payload.question,
             top_k=payload.top_k,
+            retrieval_mode=payload.retrieval_mode,
             translate_mode=payload.translate_mode,
             specialty=payload.specialty,
             nosology=payload.nosology,
@@ -535,6 +542,7 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
                 sub = retrieve(
                     payload.question,
                     top_k=backfill_k,
+                    retrieval_mode=payload.retrieval_mode,
                     translate_mode=payload.translate_mode,
                     specialty=payload.specialty,
                     nosology=payload.nosology,
@@ -624,6 +632,10 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
                     "summary": getattr(h, "summary", None),
                     "text": (h.translated_chunk_text or h.chunk_text or "").strip()[:800],
                     "score": round(h.score, 3),
+                    "chunk_id": getattr(h, "chunk_id", None),
+                    "citation_confidence": getattr(h, "citation_confidence", None),
+                    "retrieval_source": getattr(h, "retrieval_source", None),
+                    "section_context": getattr(h, "section_context", None),
                     "evidence_level": getattr(h, "evidence_level", None),
                 }
                 for i, h in enumerate(source_hits)
@@ -680,6 +692,8 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
         return {
             "question": payload.question,
             "effective_query": retrieval.effective_query,
+            "retrieval_mode": retrieval.retrieval_mode,
+            "query_variants": retrieval.query_variants,
             "sources": source_rows,
             "positions": structured.get("positions") or [],
             "consensus": structured.get("consensus"),

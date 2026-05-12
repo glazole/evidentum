@@ -470,14 +470,25 @@ def render_answer_result(data: dict) -> None:
                 source_name = src.get("source_name") or src.get("title") or "-"
                 section = src.get("section_title") or "-"
                 score = src.get("score")
+                confidence = src.get("citation_confidence")
+                chunk_id = src.get("chunk_id")
+                retrieval_source = ", ".join(src.get("retrieval_source") or [])
                 summary = (src.get("summary") or "").strip()
+                section_context = (src.get("section_context") or "").strip()
                 text = (
                     src.get("translated_chunk_text") or src.get("chunk_text") or ""
                 ).strip()
                 score_str = f" · score={score:.3f}" if score is not None else ""
+                conf_str = f" · confidence={confidence:.2f}" if confidence is not None else ""
+                chunk_str = f" · chunk={chunk_id}" if chunk_id is not None else ""
                 st.markdown(f"**[{idx}] {source_name}**{score_str}  \n*{section}*")
+                if conf_str or chunk_str or retrieval_source:
+                    st.caption(f"{chunk_str}{conf_str} · retrieval={retrieval_source or 'n/a'}")
                 if summary:
                     st.markdown(f"> {summary}")
+                if section_context:
+                    with st.expander("Контекст соседних фрагментов раздела", expanded=False):
+                        st.markdown(section_context)
                 if text:
                     st.markdown(text[:1000] + (" …" if len(text) > 1000 else ""))
                 st.divider()
@@ -596,9 +607,16 @@ def render_compare_result(data: dict) -> None:
                     frag_summary = (frag.get("summary") or "").strip()
                     text = (frag.get("text") or "").strip()
                     ev = frag.get("evidence_level")
+                    chunk_id = frag.get("chunk_id")
+                    confidence = frag.get("citation_confidence")
+                    retrieval_source = ", ".join(frag.get("retrieval_source") or [])
                     ev_str = f" · УД: {ev}" if ev else ""
+                    chunk_str = f" · chunk={chunk_id}" if chunk_id is not None else ""
+                    conf_str = f" · confidence={confidence:.2f}" if confidence is not None else ""
                     section_str = f" · *{section}*" if section else ""
-                    st.markdown(f"**{idx}.{section_str}{ev_str}**")
+                    st.markdown(f"**{idx}.{section_str}{ev_str}{chunk_str}{conf_str}**")
+                    if retrieval_source:
+                        st.caption(f"retrieval={retrieval_source}")
                     if frag_summary:
                         st.markdown(f"> {frag_summary}")
                     if text:
