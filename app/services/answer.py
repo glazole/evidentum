@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
@@ -24,6 +25,8 @@ DEFAULT_TRANSLATE_MODE = os.getenv("ANSWER_TRANSLATE_MODE", "dual_query")
 @dataclass
 class SourceItem:
     index: int
+    document_id: int | None
+    chunk_id: int | None
     source_id: str | None
     source_name: str | None  # human-readable document name (from Document.source_name)
     title: str | None
@@ -36,16 +39,23 @@ class SourceItem:
     nosology: str | None = None
     specialty: str | None = None
     evidence_level: str | None = None
+    retrieval_source: list[str] | None = None
+    semantic_score: float | None = None
+    fts_rank: float | None = None
+    citation_confidence: float | None = None
+    section_context: str | None = None
 
 
 @dataclass
 class AnswerResult:
     question: str
     effective_query: str | None
+    retrieval_mode: str | None
     model: str
     answer: str
     disclaimer: str
     sources: list[SourceItem]
+    query_variants: list[str] = field(default_factory=list)
     raw_completion: dict[str, Any] | None = None
     # Structured synthesis fields (filled when synthesize=True)
     consensus: str | None = None
@@ -99,13 +109,16 @@ class YandexOpenAIAnswerer:
             context_parts.append(
                 "\n".join(
                     filter(None, [
-                        f"[{src.index}] source_id={src.source_id or '-'}",
+                        f"[{src.index}] source_id={src.source_id or '-'} document_id={src.document_id or '-'} chunk_id={src.chunk_id or '-'}",
                         f"title={src.title or '-'}",
                         f"section={src.section_title or '-'}",
                         f"url={src.url or '-'}",
                         f"score={src.score if src.score is not None else '-'}",
+                        f"citation_confidence={src.citation_confidence if src.citation_confidence is not None else '-'}",
+                        f"retrieval_source={','.join(src.retrieval_source or []) or '-'}",
                         summary_line.rstrip() or None,
                         evidence_line.rstrip() or None,
+                        f"section_context={src.section_context[:1200]}" if src.section_context else None,
                         f"fragment={snippet}",
                     ])
                 )
@@ -152,10 +165,11 @@ class YandexOpenAIAnswerer:
             "'=== ГАЙДЛАЙН: ... ===' — НЕ номера фрагментов.\n\n"
             "Верни строгий JSON без маркдаун-разметки:\n"
             '{"positions": [{"source": "Точное название гайдлайна из заголовка", '
-            '"text": "2-4 предложения: позиция этого гайдлайна по заданному вопросу"}], '
+            '"text": "2-4 предложения: позиция этого гайдлайна по заданному вопросу с ссылками [1], [2]"}], '
             '"consensus": "Что рекомендуют все или большинство гайдлайнов, или null если консенсуса нет", '
             '"disagreements": [{"sources": ["Название 1", "Название 2"], "text": "Суть расхождения"}], '
-            '"recommendation": "Практическая заметка для врача — ТОЛЬКО на основе явно совпадающих фрагментов из разных источников; если данных недостаточно или источники расходятся — напиши об этом прямо (2-4 предложения)"}'
+            '"recommendation": "Практическая заметка для врача с ссылками [1], [2] — ТОЛЬКО на основе явно совпадающих фрагментов из разных источников; если данных недостаточно или источники расходятся — напиши об этом прямо (2-4 предложения)", '
+            '"citations": [{"idx": 1, "source_name": "Название гайдлайна", "section": "Раздел", "chunk_id": 123, "confidence": 0.82}]}'
         )
 
         # Group context by guideline (source_id), build name map
@@ -187,6 +201,8 @@ class YandexOpenAIAnswerer:
                 context_parts.append(
                     f"[{src.index}] Раздел: {section}{evidence}\n"
                     + (f"Резюме: {summary}\n" if summary else "")
+                    + (f"Контекст раздела: {src.section_context[:900]}\n" if src.section_context else "")
+                    + f"chunk_id: {src.chunk_id}; confidence: {src.citation_confidence}\n"
                     + f"Текст: {text[:1500]}"
                 )
 
@@ -238,6 +254,8 @@ def _normalize_sources(hits: Iterable[Any]) -> list[SourceItem]:
         sources.append(
             SourceItem(
                 index=i,
+                document_id=_safe_get(hit, "document_id"),
+                chunk_id=_safe_get(hit, "chunk_id"),
                 source_id=_safe_get(hit, "source_id"),
                 source_name=_safe_get(hit, "source_name"),
                 title=_safe_get(hit, "title"),
@@ -250,6 +268,11 @@ def _normalize_sources(hits: Iterable[Any]) -> list[SourceItem]:
                 nosology=_safe_get(hit, "nosology"),
                 specialty=_safe_get(hit, "specialty"),
                 evidence_level=_safe_get(hit, "evidence_level"),
+                retrieval_source=_safe_get(hit, "retrieval_source"),
+                semantic_score=_safe_get(hit, "semantic_score"),
+                fts_rank=_safe_get(hit, "fts_rank"),
+                citation_confidence=_safe_get(hit, "citation_confidence"),
+                section_context=_safe_get(hit, "section_context"),
             )
         )
     return sources
@@ -300,6 +323,7 @@ def answer_question(
     question: str,
     *,
     top_k: int = DEFAULT_TOP_K,
+    retrieval_mode: str = "hybrid",
     translate_mode: str = DEFAULT_TRANSLATE_MODE,
     model_family: str = DEFAULT_MODEL_FAMILY,
     temperature: float = DEFAULT_TEMPERATURE,
@@ -318,6 +342,7 @@ def answer_question(
     retrieval_result = retrieve(
         question,
         top_k=top_k,
+        retrieval_mode=retrieval_mode,
         translate_mode=translate_mode,
         per_source_k=per_source_k,
         specialty=specialty,
@@ -333,10 +358,12 @@ def answer_question(
         return AnswerResult(
             question=question,
             effective_query=_safe_get(retrieval_result, "effective_query"),
+            retrieval_mode=_safe_get(retrieval_result, "retrieval_mode"),
             model=YandexOpenAIAnswerer().build_model_uri(model_family),
             answer="Недостаточно информации в найденных источниках для ответа на вопрос.",
             disclaimer="Не является медицинской рекомендацией, требуется подтверждение врачом.",
             sources=[],
+            query_variants=_safe_get(retrieval_result, "query_variants", []) or [],
         )
 
     answerer = YandexOpenAIAnswerer()
@@ -354,10 +381,12 @@ def answer_question(
             return AnswerResult(
                 question=question,
                 effective_query=_safe_get(retrieval_result, "effective_query"),
+                retrieval_mode=_safe_get(retrieval_result, "retrieval_mode"),
                 model=answerer.build_model_uri(model_family),
                 answer=answer_text,
                 disclaimer="Не является медицинской рекомендацией, требуется подтверждение врачом.",
                 sources=sources,
+                query_variants=_safe_get(retrieval_result, "query_variants", []) or [],
                 consensus=structured.get("consensus"),
                 disagreements=structured.get("disagreements") or [],
                 recommendation=structured.get("recommendation"),
@@ -376,10 +405,12 @@ def answer_question(
     return AnswerResult(
         question=question,
         effective_query=_safe_get(retrieval_result, "effective_query"),
+        retrieval_mode=_safe_get(retrieval_result, "retrieval_mode"),
         model=model_uri,
         answer=answer_text,
         disclaimer="Не является медицинской рекомендацией, требуется подтверждение врачом.",
         sources=sources,
+        query_variants=_safe_get(retrieval_result, "query_variants", []) or [],
         raw_completion=raw_payload,
     )
 
@@ -388,6 +419,8 @@ def format_for_console(result: AnswerResult) -> str:
     parts = [
         f"question={result.question}",
         f"effective_query={result.effective_query}",
+        f"retrieval_mode={result.retrieval_mode}",
+        f"query_variants={result.query_variants}",
         f"model={result.model}",
         "",
         result.answer,
@@ -408,6 +441,8 @@ def format_for_ui(result: AnswerResult) -> dict[str, Any]:
         "answer": result.answer,
         "question": result.question,
         "effective_query": result.effective_query,
+        "retrieval_mode": result.retrieval_mode,
+        "query_variants": result.query_variants,
         "model": result.model,
         "disclaimer": result.disclaimer,
         "consensus": result.consensus,
@@ -421,6 +456,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate grounded answer via Yandex OpenAI-compatible API")
     parser.add_argument("question", nargs="?", help="Question for testing from console")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--retrieval-mode", choices=["vector", "hybrid"], default="hybrid")
     parser.add_argument("--translate-mode", default=DEFAULT_TRANSLATE_MODE)
     parser.add_argument("--model", default=DEFAULT_MODEL_FAMILY)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
@@ -442,6 +478,7 @@ def main() -> None:
     result = answer_question(
         question,
         top_k=args.top_k,
+        retrieval_mode=args.retrieval_mode,
         translate_mode=args.translate_mode,
         model_family=args.model,
         temperature=args.temperature,

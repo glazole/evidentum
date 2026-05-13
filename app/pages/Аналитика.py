@@ -10,6 +10,7 @@ import pandas as pd
 import altair as alt
 
 API_BASE_URL = os.getenv("UI_API_BASE_URL", "http://localhost:8000/api")
+ADMIN_API_TOKEN = os.getenv("UI_ADMIN_API_TOKEN") or os.getenv("ADMIN_API_TOKEN", "")
 
 st.title("📊 Аналитика качества ответов")
 st.caption(
@@ -24,7 +25,13 @@ st.caption(
 @st.cache_data(ttl=15, show_spinner=False)
 def load_metrics(limit: int = 100) -> dict[str, Any]:
     try:
-        r = requests.get(f"{API_BASE_URL}/metrics", params={"limit": limit}, timeout=10)
+        headers = {"X-Admin-Token": ADMIN_API_TOKEN} if ADMIN_API_TOKEN else {}
+        r = requests.get(
+            f"{API_BASE_URL}/metrics",
+            params={"limit": limit},
+            headers=headers,
+            timeout=10,
+        )
         r.raise_for_status()
         return r.json()
     except Exception as exc:

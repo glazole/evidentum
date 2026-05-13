@@ -13,7 +13,7 @@ project/
 │   └── init-letsencrypt.sh
 ├── app/
 │   ├── main.py      # FastAPI
-│   ├── ui.py        # Gradio
+│   ├── streamlit_app.py # Streamlit
 │   ├── db.py        # Create DB
 │   ├── models.py    # Data models
 │   └── services/
@@ -57,11 +57,14 @@ project/
 ```bash
 docker compose up -d --build
 ```
-2. Инициализация БД
+2. Проверка миграций БД
 ```bash
-docker compose exec app python -c "from app.db import init_db; init_db()"
+docker compose exec api alembic current
 ```
-3. Загрука (парсинг) тестового файла (любого)
+
+Миграции применяются автоматически при старте API через `alembic upgrade head`.
+
+3. Загрузка (парсинг) тестового файла (любого)
 ```bash
 docker compose exec app python -m app.services.ingest --file data/raw/your_file.pdf # рандомный тестовый файл
 ```
@@ -82,3 +85,16 @@ docker compose exec app python -m app.services.embedder --document-id 1 --limit 
 docker compose exec app python -m app.services.retriever   "антикоагулянтная терапия при фибрилляции предсердий"   --translate-mode dual_query   --top-k 8
 ```
 
+## Важные переменные окружения
+
+```bash
+ADMIN_API_TOKEN=change-me              # обязателен для upload/delete/enrich/metrics
+UI_ADMIN_API_TOKEN=change-me           # опционально, если UI должен слать отдельный токен
+CORS_ALLOW_ORIGINS=http://localhost:7860
+UPLOAD_MAX_BYTES=26214400              # лимит загрузки PDF/HTML, по умолчанию 25 МБ
+DATA_RAW_DIR=/app/data/raw
+RETRIEVER_MODE=hybrid                  # hybrid = dense vectors + Postgres FTS
+RETRIEVER_QUERY_DECOMPOSITION=1        # разбивать сложный вопрос на подзапросы
+```
+
+Если `ADMIN_API_TOKEN` не задан, административные API-ручки возвращают `503`, чтобы случайно не оставить загрузку и удаление документов открытыми.

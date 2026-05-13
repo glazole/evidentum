@@ -7,7 +7,8 @@ from pathlib import Path
 
 from sqlalchemy import func, select
 
-DATA_RAW_DIR = Path("/app/data/raw")
+from app.config import DATA_RAW_DIR
+from app.db import advisory_lock
 
 
 def _fmt_source_id(source_id: str) -> str:
@@ -202,44 +203,60 @@ def process_single_file(file_path: str) -> dict:
     Returns {"document_id": int, "status": "ingested"|"already_exists", "filename": str}.
     Called immediately after a user uploads a file via the API.
     """
-    from app.services.ingest import ingest_file
-    from app.services.embedder import embed_chunks
+    with advisory_lock(f"process_file:{Path(file_path).resolve()}") as locked:
+        if not locked:
+            return {"filename": Path(file_path).name, "status": "busy", "document_id": None}
 
-    result = ingest_file(file_path)
-    document_id: int | None = result.get("document_id")
+        from app.services.ingest import ingest_file
+        from app.services.embedder import embed_chunks
 
-    if not document_id:
-        return {"filename": Path(file_path).name, "status": "already_exists", "document_id": None}
+        result = ingest_file(file_path)
+        document_id: int | None = result.get("document_id")
 
-    # Synchronous: embed right away so search is available quickly
-    try:
-        embed_chunks(document_id=document_id)
-    except Exception as exc:
-        print(f"[autoprocess] embed error for {file_path}: {exc}", file=sys.stderr)
+        if not document_id:
+            return {"filename": Path(file_path).name, "status": "already_exists", "document_id": None}
 
-    # Synchronous: generate readable title (fast single LLM call)
-    _generate_title(document_id, force=True)
-
-    # Async: enrichment is slow — run in background thread
-    def _enrich() -> None:
+        # Synchronous: embed right away so search is available quickly
         try:
-            from app.services.enricher import enrich_chunks
-            from app.services.embedder import embed_chunks as _embed
-            from app.services.llm import get_llm_client
-            llm = get_llm_client()
-            enrich_chunks(document_id, llm=llm)
-            _embed(document_id=document_id, only_missing=False)
-            print(f"[autoprocess] enrich+re-embed done for doc {document_id}", file=sys.stderr)
+            embed_chunks(document_id=document_id)
         except Exception as exc:
-            print(f"[autoprocess] enrich error for doc {document_id}: {exc}", file=sys.stderr)
+            print(f"[autoprocess] embed error for {file_path}: {exc}", file=sys.stderr)
 
-    t = threading.Thread(target=_enrich, daemon=True, name=f"enrich-upload-{document_id}")
-    t.start()
+        # Synchronous: generate readable title (fast single LLM call)
+        _generate_title(document_id, force=True)
 
-    return {"filename": Path(file_path).name, "status": "ingested", "document_id": document_id}
+        # Async: enrichment is slow — run in background thread
+        def _enrich() -> None:
+            with advisory_lock(f"doc:{document_id}:enrich") as enrich_locked:
+                if not enrich_locked:
+                    print(f"[autoprocess] enrich skipped, doc {document_id} is already locked", file=sys.stderr)
+                    return
+                try:
+                    from app.services.enricher import enrich_chunks
+                    from app.services.embedder import embed_chunks as _embed
+                    from app.services.llm import get_llm_client
+                    llm = get_llm_client()
+                    enrich_chunks(document_id, llm=llm)
+                    _embed(document_id=document_id, only_missing=False)
+                    print(f"[autoprocess] enrich+re-embed done for doc {document_id}", file=sys.stderr)
+                except Exception as exc:
+                    print(f"[autoprocess] enrich error for doc {document_id}: {exc}", file=sys.stderr)
+
+        t = threading.Thread(target=_enrich, daemon=True, name=f"enrich-upload-{document_id}")
+        t.start()
+
+        return {"filename": Path(file_path).name, "status": "ingested", "document_id": document_id}
 
 
 def run_autoprocess(data_dir: Path = DATA_RAW_DIR) -> None:
+    with advisory_lock("autoprocess") as locked:
+        if not locked:
+            print("[autoprocess] skipped: another autoprocess is already running", file=sys.stderr)
+            return
+        _run_autoprocess_locked(data_dir)
+
+
+def _run_autoprocess_locked(data_dir: Path = DATA_RAW_DIR) -> None:
     """
     1. Ingest any new PDF/HTML files in data_dir that are not yet in the DB.
     2. Embed any documents that have chunks without embeddings.
@@ -257,7 +274,7 @@ def run_autoprocess(data_dir: Path = DATA_RAW_DIR) -> None:
                 continue
             try:
                 result = ingest_file(str(f))
-                status = "ingested" if result.get("inserted") else "already in DB"
+                status = "ingested" if result.get("updated") else "already in DB"
                 print(f"[autoprocess] {f.name}: {status}", file=sys.stderr)
             except Exception as exc:
                 print(f"[autoprocess] ingest error {f.name}: {exc}", file=sys.stderr)
@@ -315,13 +332,17 @@ def run_autoprocess(data_dir: Path = DATA_RAW_DIR) -> None:
             for doc_id in doc_ids:
                 print(f"[autoprocess] enriching doc {doc_id}…", file=sys.stderr)
                 try:
-                    stats = enrich_chunks(doc_id, llm=llm)
-                    print(f"[autoprocess] enriched doc {doc_id}: {stats}", file=sys.stderr)
+                    with advisory_lock(f"doc:{doc_id}:enrich") as enrich_locked:
+                        if not enrich_locked:
+                            print(f"[autoprocess] enrich skipped, doc {doc_id} is already locked", file=sys.stderr)
+                            continue
+                        stats = enrich_chunks(doc_id, llm=llm)
+                        print(f"[autoprocess] enriched doc {doc_id}: {stats}", file=sys.stderr)
 
-                    # Re-embed after enrichment (summary now available)
-                    from app.services.embedder import embed_chunks as _embed
-                    _embed(document_id=doc_id, only_missing=False)
-                    print(f"[autoprocess] re-embedded doc {doc_id} after enrichment", file=sys.stderr)
+                        # Re-embed after enrichment (summary now available)
+                        from app.services.embedder import embed_chunks as _embed
+                        _embed(document_id=doc_id, only_missing=False)
+                        print(f"[autoprocess] re-embedded doc {doc_id} after enrichment", file=sys.stderr)
                 except Exception as exc:
                     print(f"[autoprocess] enrich error doc {doc_id}: {exc}", file=sys.stderr)
 

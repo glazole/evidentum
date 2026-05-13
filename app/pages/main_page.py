@@ -10,6 +10,7 @@ import streamlit as st
 
 API_BASE_URL = os.getenv("UI_API_BASE_URL", "http://localhost:8000/api")
 REQUEST_TIMEOUT = int(os.getenv("UI_REQUEST_TIMEOUT", "180"))
+ADMIN_API_TOKEN = os.getenv("UI_ADMIN_API_TOKEN") or os.getenv("ADMIN_API_TOKEN", "")
 
 # Значения по умолчанию, когда «Гибкая настройка» выключена
 _DEFAULT_MODEL = "alice"
@@ -65,6 +66,9 @@ st.markdown(
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
+def admin_headers() -> dict[str, str]:
+    return {"X-Admin-Token": ADMIN_API_TOKEN} if ADMIN_API_TOKEN else {}
+
 @st.cache_data(ttl=20, show_spinner=False)
 def load_sources() -> list[dict]:
     try:
@@ -87,6 +91,7 @@ def api_upload(file_bytes: bytes, filename: str) -> dict[str, Any]:
     r = requests.post(
         f"{API_BASE_URL}/upload",
         files={"file": (filename, file_bytes, "application/pdf")},
+        headers=admin_headers(),
         timeout=60,
     )
     r.raise_for_status()
@@ -167,6 +172,7 @@ def _api_trigger(document_id: int, stage: str) -> dict[str, Any]:
     """POST /api/documents/{id}/{stage} and return response dict."""
     r = requests.post(
         f"{API_BASE_URL}/documents/{document_id}/{stage}",
+        headers=admin_headers(),
         timeout=15,
     )
     r.raise_for_status()
@@ -177,6 +183,7 @@ def _api_delete_document(document_id: int) -> dict[str, Any]:
     """DELETE /api/documents/{id}."""
     r = requests.delete(
         f"{API_BASE_URL}/documents/{document_id}",
+        headers=admin_headers(),
         timeout=15,
     )
     r.raise_for_status()
@@ -188,6 +195,7 @@ def _api_patch_document_name(document_id: int, source_name: str) -> dict[str, An
     r = requests.post(
         f"{API_BASE_URL}/documents/{document_id}/rename",
         json={"source_name": source_name},
+        headers=admin_headers(),
         timeout=15,
     )
     r.raise_for_status()
@@ -462,14 +470,25 @@ def render_answer_result(data: dict) -> None:
                 source_name = src.get("source_name") or src.get("title") or "-"
                 section = src.get("section_title") or "-"
                 score = src.get("score")
+                confidence = src.get("citation_confidence")
+                chunk_id = src.get("chunk_id")
+                retrieval_source = ", ".join(src.get("retrieval_source") or [])
                 summary = (src.get("summary") or "").strip()
+                section_context = (src.get("section_context") or "").strip()
                 text = (
                     src.get("translated_chunk_text") or src.get("chunk_text") or ""
                 ).strip()
                 score_str = f" · score={score:.3f}" if score is not None else ""
+                conf_str = f" · confidence={confidence:.2f}" if confidence is not None else ""
+                chunk_str = f" · chunk={chunk_id}" if chunk_id is not None else ""
                 st.markdown(f"**[{idx}] {source_name}**{score_str}  \n*{section}*")
+                if conf_str or chunk_str or retrieval_source:
+                    st.caption(f"{chunk_str}{conf_str} · retrieval={retrieval_source or 'n/a'}")
                 if summary:
                     st.markdown(f"> {summary}")
+                if section_context:
+                    with st.expander("Контекст соседних фрагментов раздела", expanded=False):
+                        st.markdown(section_context)
                 if text:
                     st.markdown(text[:1000] + (" …" if len(text) > 1000 else ""))
                 st.divider()
@@ -588,9 +607,16 @@ def render_compare_result(data: dict) -> None:
                     frag_summary = (frag.get("summary") or "").strip()
                     text = (frag.get("text") or "").strip()
                     ev = frag.get("evidence_level")
+                    chunk_id = frag.get("chunk_id")
+                    confidence = frag.get("citation_confidence")
+                    retrieval_source = ", ".join(frag.get("retrieval_source") or [])
                     ev_str = f" · УД: {ev}" if ev else ""
+                    chunk_str = f" · chunk={chunk_id}" if chunk_id is not None else ""
+                    conf_str = f" · confidence={confidence:.2f}" if confidence is not None else ""
                     section_str = f" · *{section}*" if section else ""
-                    st.markdown(f"**{idx}.{section_str}{ev_str}**")
+                    st.markdown(f"**{idx}.{section_str}{ev_str}{chunk_str}{conf_str}**")
+                    if retrieval_source:
+                        st.caption(f"retrieval={retrieval_source}")
                     if frag_summary:
                         st.markdown(f"> {frag_summary}")
                     if text:

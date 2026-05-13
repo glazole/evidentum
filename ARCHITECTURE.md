@@ -66,7 +66,7 @@ chunks
   section_title   TEXT
   chunk_text      TEXT
   char_count      INTEGER
-  embedding       vector(256)    -- pgvector, индекс ivfflat/cosine
+  embedding       vector(256)    -- pgvector, HNSW/cosine индекс
   -- LLM-обогащение на уровне фрагмента
   summary         TEXT           -- 2-3 предложения от YandexGPT
   nosology        VARCHAR(256)   -- "Фибрилляция предсердий I48"
@@ -75,7 +75,8 @@ chunks
   evidence_level  VARCHAR(32)    -- "1A" | "2B" | null
 ```
 
-Индексы: `ix_chunks_nosology`, `ix_chunks_specialty`, pgvector-индекс на `embedding`.
+Индексы: `ix_chunks_nosology`, `ix_chunks_specialty`, `ix_documents_region`,
+`ix_documents_year`, HNSW/cosine pgvector-индекс на `chunks.embedding`.
 
 ---
 
@@ -142,6 +143,9 @@ PDF / HTML файл
   ┌─────┴──────────────────────────────┐
   │           Два прохода              │
   │                                    │
+  │  Query decomposition              │
+  │  сложный вопрос → 1..4 подзапроса │
+  │                                    │
   │  Проход 1: RU-запрос              │
   │  query_ru → Yandex Embeddings     │
   │  (text-search-query/latest)       │
@@ -156,6 +160,10 @@ PDF / HTML файл
   │  → vector(256)                    │
   │  → pgvector cosine_distance()     │
   │  → top-K*4 кандидатов             │
+  │                                    │
+  │  Проход 3: Postgres FTS            │
+  │  websearch_to_tsquery(simple)      │
+  │  → GIN индекс ix_chunks_fts_simple │
   └─────┬──────────────────────────────┘
         │
         ▼  merge_and_rerank_hits()
@@ -166,13 +174,17 @@ PDF / HTML файл
   │     (берём лучший из двух проходов)     │
   │                                         │
   │  2. Переосчёт score:                    │
-  │     base = 1.0 - cosine_distance        │
+  │     base = dense_score + fts_score      │
   │     + region_bonus   (RU +0.05)         │
   │     + section_bonus  ("лечение" +0.04,  │
   │                       "оглавление" -0.08)│
   │     + lexical_overlap (+0..+0.08)       │
+  │     + phrase/multi-signal bonuses       │
   │                                         │
-  │  3. Ограничение: max 2 чанка/документ   │
+  │  3. Section context: соседние чанки     │
+  │     из того же раздела для grounding    │
+  │                                         │
+  │  4. Ограничение: max 2 чанка/документ   │
   │     (для режима "Ответ")                │
   └─────┬───────────────────────────────────┘
         │  top-K hits
@@ -523,10 +535,16 @@ networks:
 ```
 alembic/versions/
 ├── 20260414_0001_initial.py        # documents + chunks + embeddings
-└── 20260417_0003_llm_enrichment.py # summary/nosology/topic/... на chunks и documents
+├── 20260417_0003_llm_enrichment.py # summary/nosology/topic/... на chunks и documents
+├── 20260418_0004_query_logs.py     # журнал запросов, оценки и feedback
+├── 20260511_0005_retrieval_indexes.py # HNSW + фильтры documents.region/year
+└── 20260512_0006_hybrid_fts_index.py  # GIN FTS индекс для hybrid retrieval
 ```
 
-Применение: `docker exec mvp_api alembic upgrade head`
+Применение вручную: `docker exec mvp_api alembic upgrade head`
+
+В Docker Compose API запускает `alembic upgrade head` перед `uvicorn`, поэтому схема
+обновляется до старта приложения.
 
 ---
 

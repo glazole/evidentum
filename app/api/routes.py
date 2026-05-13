@@ -1,26 +1,93 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import distinct, func, select
 
-DATA_RAW_DIR = Path("/app/data/raw")
-
-from app.db import session_scope
+from app.config import ADMIN_API_TOKEN, DATA_RAW_DIR, UPLOAD_MAX_BYTES
+from app.db import advisory_lock, session_scope
 from app.models import Chunk, Document
 from app.services.answer import answer_question, format_for_ui
 from app.services.retriever import retrieve
 
 
 router = APIRouter()
+AdminTokenHeader = Annotated[str | None, Header(alias="X-Admin-Token")]
 
 
 TranslateMode = Literal["off", "query", "query_and_hits", "dual_query"]
+RetrievalMode = Literal["vector", "hybrid"]
+
+
+def require_admin_token(x_admin_token: AdminTokenHeader = None) -> None:
+    if not ADMIN_API_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ADMIN_API_TOKEN is not configured.",
+        )
+    if x_admin_token != ADMIN_API_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin token.",
+        )
+
+
+def _safe_upload_destination(filename: str | None) -> Path:
+    raw_name = filename or "upload.pdf"
+    base_name = Path(raw_name).name.strip()
+    if not base_name or base_name in {".", ".."}:
+        base_name = "upload.pdf"
+
+    suffix = Path(base_name).suffix.lower()
+    if suffix not in {".pdf", ".html", ".htm"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Поддерживаются только файлы PDF и HTML.",
+        )
+
+    stem = Path(base_name).stem[:80].strip(" ._") or "upload"
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem)
+    dest = DATA_RAW_DIR / f"{safe_stem}{suffix}"
+
+    raw_root = DATA_RAW_DIR.resolve(strict=False)
+    resolved_dest = dest.resolve(strict=False)
+    if raw_root != resolved_dest and raw_root not in resolved_dest.parents:
+        raise HTTPException(status_code=400, detail="Некорректное имя файла.")
+    return dest
+
+
+def _save_upload_file(file: UploadFile, dest: Path) -> int:
+    total = 0
+    try:
+        out = dest.open("xb")
+    except FileExistsError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Файл «{dest.name}» уже существует на сервере.",
+        )
+
+    with out:
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > UPLOAD_MAX_BYTES:
+                out.close()
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Файл слишком большой. Лимит: {UPLOAD_MAX_BYTES} байт.",
+                )
+            out.write(chunk)
+    return total
 
 
 class HealthResponse(BaseModel):
@@ -56,6 +123,7 @@ class CatalogResponse(BaseModel):
 class RetrieveRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=6, ge=1, le=20)
+    retrieval_mode: RetrievalMode = "hybrid"
     translate_mode: TranslateMode = "dual_query"
     document_id: int | None = None
     source_id: str | None = None
@@ -69,6 +137,7 @@ class RetrieveRequest(BaseModel):
 class AnswerRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=6, ge=1, le=20)
+    retrieval_mode: RetrievalMode = "hybrid"
     translate_mode: TranslateMode = "dual_query"
     model: str = "alice"
     temperature: float = Field(default=0.2, ge=0.0, le=1.5)
@@ -84,6 +153,7 @@ class AnswerRequest(BaseModel):
 class CompareRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=12, ge=1, le=30)
+    retrieval_mode: RetrievalMode = "hybrid"
     translate_mode: TranslateMode = "dual_query"
     model: str = "alice"
     temperature: float = Field(default=0.2, ge=0.0, le=1.5)
@@ -344,6 +414,7 @@ def retrieve_route(payload: RetrieveRequest) -> dict[str, Any]:
         result = retrieve(
             payload.question,
             top_k=payload.top_k,
+            retrieval_mode=payload.retrieval_mode,
             document_id=payload.document_id,
             source_id=payload.source_id,
             region=payload.region,
@@ -366,6 +437,7 @@ def answer_route(payload: AnswerRequest, background_tasks: BackgroundTasks) -> d
         result = answer_question(
             payload.question,
             top_k=payload.top_k,
+            retrieval_mode=payload.retrieval_mode,
             translate_mode=payload.translate_mode,
             model_family=payload.model,
             temperature=payload.temperature,
@@ -376,6 +448,7 @@ def answer_route(payload: AnswerRequest, background_tasks: BackgroundTasks) -> d
             nosology=payload.nosology,
             per_source_k=payload.per_source_k,
             source_id=payload.source_id,
+            document_id=payload.document_id,
         )
         ui_data = format_for_ui(result)
         elapsed_ms = int((_time.time() - t0) * 1000)
@@ -445,6 +518,7 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
         retrieval = retrieve(
             payload.question,
             top_k=payload.top_k,
+            retrieval_mode=payload.retrieval_mode,
             translate_mode=payload.translate_mode,
             specialty=payload.specialty,
             nosology=payload.nosology,
@@ -468,6 +542,7 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
                 sub = retrieve(
                     payload.question,
                     top_k=backfill_k,
+                    retrieval_mode=payload.retrieval_mode,
                     translate_mode=payload.translate_mode,
                     specialty=payload.specialty,
                     nosology=payload.nosology,
@@ -557,6 +632,10 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
                     "summary": getattr(h, "summary", None),
                     "text": (h.translated_chunk_text or h.chunk_text or "").strip()[:800],
                     "score": round(h.score, 3),
+                    "chunk_id": getattr(h, "chunk_id", None),
+                    "citation_confidence": getattr(h, "citation_confidence", None),
+                    "retrieval_source": getattr(h, "retrieval_source", None),
+                    "section_context": getattr(h, "section_context", None),
                     "evidence_level": getattr(h, "evidence_level", None),
                 }
                 for i, h in enumerate(source_hits)
@@ -613,6 +692,8 @@ def compare_route(payload: CompareRequest, background_tasks: BackgroundTasks) ->
         return {
             "question": payload.question,
             "effective_query": retrieval.effective_query,
+            "retrieval_mode": retrieval.retrieval_mode,
+            "query_variants": retrieval.query_variants,
             "sources": source_rows,
             "positions": structured.get("positions") or [],
             "consensus": structured.get("consensus"),
@@ -632,7 +713,11 @@ class TriggerResponse(BaseModel):
     message: str
 
 
-@router.post("/documents/{document_id}/embed", response_model=TriggerResponse)
+@router.post(
+    "/documents/{document_id}/embed",
+    response_model=TriggerResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 def trigger_embed(document_id: int, background_tasks: BackgroundTasks) -> TriggerResponse:
     """Force-trigger embedding for a specific document (runs in background)."""
     with session_scope() as session:
@@ -642,11 +727,15 @@ def trigger_embed(document_id: int, background_tasks: BackgroundTasks) -> Trigge
 
     def _embed() -> None:
         from app.services.embedder import embed_chunks
-        try:
-            stats = embed_chunks(document_id=document_id)
-            print(f"[trigger] embed doc {document_id}: {stats}", file=__import__("sys").stderr)
-        except Exception as exc:
-            print(f"[trigger] embed error doc {document_id}: {exc}", file=__import__("sys").stderr)
+        with advisory_lock(f"doc:{document_id}:embed") as locked:
+            if not locked:
+                print(f"[trigger] embed skipped, doc {document_id} is already locked", file=__import__("sys").stderr)
+                return
+            try:
+                stats = embed_chunks(document_id=document_id)
+                print(f"[trigger] embed doc {document_id}: {stats}", file=__import__("sys").stderr)
+            except Exception as exc:
+                print(f"[trigger] embed error doc {document_id}: {exc}", file=__import__("sys").stderr)
 
     background_tasks.add_task(_embed)
     return TriggerResponse(
@@ -657,7 +746,11 @@ def trigger_embed(document_id: int, background_tasks: BackgroundTasks) -> Trigge
     )
 
 
-@router.post("/documents/{document_id}/enrich", response_model=TriggerResponse)
+@router.post(
+    "/documents/{document_id}/enrich",
+    response_model=TriggerResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 def trigger_enrich(document_id: int, background_tasks: BackgroundTasks) -> TriggerResponse:
     """Force-trigger LLM enrichment for a specific document (runs in background).
 
@@ -674,15 +767,19 @@ def trigger_enrich(document_id: int, background_tasks: BackgroundTasks) -> Trigg
         from app.services.enricher import enrich_chunks
         from app.services.embedder import embed_chunks
         from app.services.llm import get_llm_client
-        try:
-            llm = get_llm_client()
-            # only_missing=False: retry all, including summary="" (error-marked) chunks
-            stats = enrich_chunks(document_id, only_missing=False, llm=llm)
-            print(f"[trigger] enrich doc {document_id}: {stats}", file=__import__("sys").stderr)
-            embed_chunks(document_id=document_id, only_missing=False)
-            print(f"[trigger] re-embed after enrich doc {document_id}", file=__import__("sys").stderr)
-        except Exception as exc:
-            print(f"[trigger] enrich error doc {document_id}: {exc}", file=__import__("sys").stderr)
+        with advisory_lock(f"doc:{document_id}:enrich") as locked:
+            if not locked:
+                print(f"[trigger] enrich skipped, doc {document_id} is already locked", file=__import__("sys").stderr)
+                return
+            try:
+                llm = get_llm_client()
+                # only_missing=False: retry all, including summary="" (error-marked) chunks
+                stats = enrich_chunks(document_id, only_missing=False, llm=llm)
+                print(f"[trigger] enrich doc {document_id}: {stats}", file=__import__("sys").stderr)
+                embed_chunks(document_id=document_id, only_missing=False)
+                print(f"[trigger] re-embed after enrich doc {document_id}", file=__import__("sys").stderr)
+            except Exception as exc:
+                print(f"[trigger] enrich error doc {document_id}: {exc}", file=__import__("sys").stderr)
 
     background_tasks.add_task(_enrich)
     return TriggerResponse(
@@ -693,7 +790,11 @@ def trigger_enrich(document_id: int, background_tasks: BackgroundTasks) -> Trigg
     )
 
 
-@router.post("/documents/{document_id}/title", response_model=TriggerResponse)
+@router.post(
+    "/documents/{document_id}/title",
+    response_model=TriggerResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 def trigger_title(document_id: int, background_tasks: BackgroundTasks) -> TriggerResponse:
     """Force-regenerate the display title for a document (runs in background)."""
     with session_scope() as session:
@@ -703,10 +804,14 @@ def trigger_title(document_id: int, background_tasks: BackgroundTasks) -> Trigge
 
     def _title() -> None:
         from app.services.autoprocess import _generate_title
-        try:
-            _generate_title(document_id, force=True)
-        except Exception as exc:
-            print(f"[trigger] title error doc {document_id}: {exc}", file=__import__("sys").stderr)
+        with advisory_lock(f"doc:{document_id}:title") as locked:
+            if not locked:
+                print(f"[trigger] title skipped, doc {document_id} is already locked", file=__import__("sys").stderr)
+                return
+            try:
+                _generate_title(document_id, force=True)
+            except Exception as exc:
+                print(f"[trigger] title error doc {document_id}: {exc}", file=__import__("sys").stderr)
 
     background_tasks.add_task(_title)
     return TriggerResponse(
@@ -725,7 +830,11 @@ class DeleteDocumentResponse(BaseModel):
     message: str
 
 
-@router.delete("/documents/{document_id}", response_model=DeleteDocumentResponse)
+@router.delete(
+    "/documents/{document_id}",
+    response_model=DeleteDocumentResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 def delete_document(document_id: int) -> DeleteDocumentResponse:
     """
     Delete a document and all its chunks from the database.
@@ -826,13 +935,21 @@ def _update_document_source_name(document_id: int, body: PatchDocumentBody) -> P
     )
 
 
-@router.patch("/documents/{document_id}", response_model=PatchDocumentResponse)
+@router.patch(
+    "/documents/{document_id}",
+    response_model=PatchDocumentResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 def patch_document(document_id: int, body: PatchDocumentBody) -> PatchDocumentResponse:
     """Update human-readable display name (`source_name`) for a document."""
     return _update_document_source_name(document_id, body)
 
 
-@router.post("/documents/{document_id}/rename", response_model=PatchDocumentResponse)
+@router.post(
+    "/documents/{document_id}/rename",
+    response_model=PatchDocumentResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 def rename_document(document_id: int, body: PatchDocumentBody) -> PatchDocumentResponse:
     """Same as PATCH /documents/{id} — POST for proxies / clients that disallow PATCH."""
     return _update_document_source_name(document_id, body)
@@ -840,12 +957,16 @@ def rename_document(document_id: int, body: PatchDocumentBody) -> PatchDocumentR
 
 class UploadResponse(BaseModel):
     filename: str
-    status: str          # "ingested" | "already_exists"
+    status: str          # "accepted"
     document_id: int | None = None
     message: str
 
 
-@router.post("/upload", response_model=UploadResponse)
+@router.post(
+    "/upload",
+    response_model=UploadResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -856,25 +977,16 @@ async def upload_document(
       - ingested + embedded synchronously (available for search in ~seconds)
       - LLM-enriched asynchronously in background (quality improves over minutes)
     """
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in {".pdf", ".html", ".htm"}:
-        raise HTTPException(
-            status_code=400,
-            detail="Поддерживаются только файлы PDF и HTML.",
-        )
-
     DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
-    dest = DATA_RAW_DIR / (file.filename or "upload.pdf")
+    dest = _safe_upload_destination(file.filename)
 
-    if dest.exists():
-        raise HTTPException(
-            status_code=409,
-            detail=f"Файл «{file.filename}» уже существует на сервере.",
-        )
-
-    # Save file
-    with dest.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
+    saved_bytes = _save_upload_file(file, dest)
+    if saved_bytes <= 0:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="Файл пустой.")
 
     # Process in background (ingest + embed sync, enrich async inside)
     def _process() -> None:
@@ -885,10 +997,10 @@ async def upload_document(
 
     return UploadResponse(
         filename=file.filename or dest.name,
-        status="ingested",
+        status="accepted",
         document_id=None,
         message=(
-            "Файл принят. Идексация запущена в фоне: "
+            "Файл принят. Индексация запущена в фоне: "
             "эмбеддинги готовы через ~30 сек, LLM-обогащение — через несколько минут. "
             "Статус появится в блоке «Используемые гайдлайны» внизу страницы."
         ),
@@ -913,11 +1025,11 @@ def submit_feedback(log_id: int, payload: FeedbackRequest) -> dict[str, Any]:
     return {"log_id": log_id, "feedback": payload.feedback, "status": "saved"}
 
 
-@router.get("/metrics")
+@router.get("/metrics", dependencies=[Depends(require_admin_token)])
 def get_metrics(limit: int = 50) -> dict[str, Any]:
     """Return aggregated LLM-judge scores and user feedback statistics."""
     from app.models import QueryLog
-    from sqlalchemy import case, cast, Float
+    from sqlalchemy import cast
 
     with session_scope() as session:
         total = session.scalar(select(func.count(QueryLog.id))) or 0
@@ -1007,17 +1119,26 @@ def get_metrics(limit: int = 50) -> dict[str, Any]:
 
 
 def _generate_summary_task(document_id: int, model_family: str) -> None:
-    try:
-        from app.services.summarizer import generate_document_summary
-        from app.services.llm import get_llm_client
-        llm = get_llm_client(model_family=model_family)
-        generate_document_summary(document_id, llm=llm)
-    except Exception as exc:
-        import sys
-        print(f"[summarizer] error for document {document_id}: {exc}", file=sys.stderr)
+    with advisory_lock(f"doc:{document_id}:summary") as locked:
+        if not locked:
+            import sys
+            print(f"[summarizer] skipped, doc {document_id} is already locked", file=sys.stderr)
+            return
+        try:
+            from app.services.summarizer import generate_document_summary
+            from app.services.llm import get_llm_client
+            llm = get_llm_client(model_family=model_family)
+            generate_document_summary(document_id, llm=llm)
+        except Exception as exc:
+            import sys
+            print(f"[summarizer] error for document {document_id}: {exc}", file=sys.stderr)
 
 
-@router.post("/documents/{document_id}/summary", response_model=DocumentSummaryResponse)
+@router.post(
+    "/documents/{document_id}/summary",
+    response_model=DocumentSummaryResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 def generate_summary(
     document_id: int,
     background_tasks: BackgroundTasks,

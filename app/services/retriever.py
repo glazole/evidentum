@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Literal
 
 import requests
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, literal_column, select
 
 from app.db import session_scope
 from app.models import Chunk, Document
@@ -49,9 +49,21 @@ PERSONAL_YANDEX_FOLDER_ID = os.getenv("PERSONAL_YANDEX_FOLDER_ID", "")
 PERSONAL_YANDEX_API_KEY = os.getenv("PERSONAL_YANDEX_API_KEY", "")
 PERSONAL_YANDEX_IAM_TOKEN = os.getenv("PERSONAL_YANDEX_IAM_TOKEN", "")
 
+RETRIEVAL_MODE = os.getenv("RETRIEVER_MODE", "hybrid")
+QUERY_DECOMPOSITION_ENABLED = os.getenv("RETRIEVER_QUERY_DECOMPOSITION", "1") not in {"0", "false", "False"}
+QUERY_DECOMPOSITION_MAX_VARIANTS = int(os.getenv("RETRIEVER_QUERY_DECOMPOSITION_MAX_VARIANTS", "4"))
+FTS_CANDIDATE_MIN = int(os.getenv("RETRIEVER_FTS_CANDIDATE_MIN", "24"))
+FTS_CANDIDATE_MULTIPLIER = int(os.getenv("RETRIEVER_FTS_CANDIDATE_MULTIPLIER", "4"))
+HYBRID_SEMANTIC_WEIGHT = float(os.getenv("RETRIEVER_HYBRID_SEMANTIC_WEIGHT", "0.72"))
+HYBRID_FTS_WEIGHT = float(os.getenv("RETRIEVER_HYBRID_FTS_WEIGHT", "0.28"))
+PHRASE_MATCH_BONUS = float(os.getenv("RETRIEVER_PHRASE_MATCH_BONUS", "0.04"))
+MULTI_SIGNAL_BONUS = float(os.getenv("RETRIEVER_MULTI_SIGNAL_BONUS", "0.05"))
+SECTION_CONTEXT_MAX_CHARS = int(os.getenv("RETRIEVER_SECTION_CONTEXT_MAX_CHARS", "1200"))
+
 
 TranslateMode = Literal["off", "query", "query_and_hits", "dual_query"]
 CredentialProfile = Literal["default", "personal"]
+RetrievalMode = Literal["vector", "hybrid"]
 
 
 @dataclass
@@ -90,12 +102,19 @@ class RetrievalHit:
     retrieval_source: list[str] | None = None   # raw_query | translated_query
     translated_chunk_text: str | None = None
     translation_detected_language: str | None = None
+    semantic_score: float | None = None
+    fts_rank: float | None = None
+    hybrid_score: float | None = None
+    citation_confidence: float | None = None
+    section_context: str | None = None
 
 
 @dataclass
 class RetrievalResult:
     query: str
     effective_query: str
+    retrieval_mode: str
+    query_variants: list[str]
     translate_mode: str
     translation_used: bool
     query_translation: TranslationResult | None
@@ -272,6 +291,44 @@ LEXICAL_OVERLAP_MAX_BONUS = float(os.getenv("RETRIEVER_LEXICAL_OVERLAP_MAX_BONUS
 def raw_candidate_top_k(top_k: int) -> int:
     return max(clamp_top_k(top_k) * RAW_CANDIDATE_MULTIPLIER, RAW_CANDIDATE_MIN)
 
+
+def fts_candidate_top_k(top_k: int) -> int:
+    return max(clamp_top_k(top_k) * FTS_CANDIDATE_MULTIPLIER, FTS_CANDIDATE_MIN)
+
+
+_QUERY_SPLIT_RE = re.compile(
+    r"(?:\n+|[;?]+|\s+(?:и|или|а также|также|and|or|plus)\s+)",
+    re.IGNORECASE,
+)
+
+
+def decompose_query(query: str) -> list[str]:
+    """Return the original query plus meaningful subquestions for multi-intent asks."""
+    raw = " ".join((query or "").split())
+    if not raw:
+        return []
+    if not QUERY_DECOMPOSITION_ENABLED:
+        return [raw]
+
+    variants: list[str] = [raw]
+    seen = {raw.lower()}
+
+    for part in _QUERY_SPLIT_RE.split(raw):
+        candidate = " ".join(part.strip(" ,.:").split())
+        if len(candidate) < 12:
+            continue
+        if len(extract_query_terms(candidate)) < 2:
+            continue
+        key = candidate.lower()
+        if key in seen or key == raw.lower():
+            continue
+        seen.add(key)
+        variants.append(candidate)
+        if len(variants) >= QUERY_DECOMPOSITION_MAX_VARIANTS:
+            break
+
+    return variants
+
 def build_retrieval_stmt(
     query_embedding: list[float],
     *,
@@ -362,8 +419,16 @@ def build_retrieval_stmt(
     return stmt
 
 
-def _hit_from_row(chunk: Any, document: Any, distance: float, retrieval_source: str) -> RetrievalHit:
+def _hit_from_row(
+    chunk: Any,
+    document: Any,
+    distance: float,
+    retrieval_source: str,
+    *,
+    fts_rank: float | None = None,
+) -> RetrievalHit:
     dist = float(distance)
+    semantic_score = score_from_distance(dist) if retrieval_source != "fts" else None
     return RetrievalHit(
         chunk_id=chunk.id,
         document_id=chunk.document_id,
@@ -384,8 +449,10 @@ def _hit_from_row(chunk: Any, document: Any, distance: float, retrieval_source: 
         topic=getattr(chunk, "topic", None),
         evidence_level=getattr(chunk, "evidence_level", None),
         distance=dist,
-        score=score_from_distance(dist),
+        score=semantic_score if semantic_score is not None else score_from_fts_rank(fts_rank),
         retrieval_source=[retrieval_source],
+        semantic_score=semantic_score,
+        fts_rank=fts_rank,
     )
 
 
@@ -418,6 +485,7 @@ def fetch_hits_for_embedding(
             hits: list[RetrievalHit] = []
             for row in rows_mapped:
                 dist = float(row["distance"])
+                semantic_score = score_from_distance(dist)
                 hits.append(
                     RetrievalHit(
                         chunk_id=row["chunk_id"],
@@ -439,8 +507,9 @@ def fetch_hits_for_embedding(
                         topic=row.get("topic"),
                         evidence_level=row.get("evidence_level"),
                         distance=dist,
-                        score=score_from_distance(dist),
+                        score=semantic_score,
                         retrieval_source=[retrieval_source],
+                        semantic_score=semantic_score,
                     )
                 )
             return hits
@@ -450,6 +519,98 @@ def fetch_hits_for_embedding(
     hits = []
     for chunk, document, distance in rows:
         hits.append(_hit_from_row(chunk, document, float(distance), retrieval_source))
+    return hits
+
+
+def _fts_vector_expr() -> Any:
+    empty = literal_column("''")
+    text_expr = func.concat_ws(
+        literal_column("' '"),
+        func.coalesce(Chunk.section_title, empty),
+        func.coalesce(Chunk.summary, empty),
+        func.coalesce(Chunk.nosology, empty),
+        func.coalesce(Chunk.specialty, empty),
+        func.coalesce(Chunk.topic, empty),
+        func.coalesce(Chunk.evidence_level, empty),
+        func.coalesce(Chunk.chunk_text, empty),
+    )
+    return func.to_tsvector(literal_column("'simple'"), text_expr)
+
+
+def build_fts_stmt(
+    query_text: str,
+    *,
+    top_k: int,
+    document_id: int | None = None,
+    source_id: str | None = None,
+    region: str | None = None,
+    specialty: str | None = None,
+    nosology: str | None = None,
+) -> Select:
+    fts_vector = _fts_vector_expr()
+    ts_query = func.websearch_to_tsquery(literal_column("'simple'"), query_text)
+    rank_expr = func.ts_rank_cd(fts_vector, ts_query)
+
+    stmt = (
+        select(Chunk, Document, rank_expr.label("fts_rank"))
+        .join(Document, Document.id == Chunk.document_id)
+        .where(fts_vector.op("@@")(ts_query))
+        .order_by(rank_expr.desc(), Chunk.document_id.asc(), Chunk.chunk_index.asc())
+        .limit(clamp_top_k(top_k))
+    )
+
+    if document_id is not None:
+        stmt = stmt.where(Chunk.document_id == document_id)
+    if source_id:
+        stmt = stmt.where(Document.source_id == source_id)
+    if region:
+        stmt = stmt.where(Document.region == region)
+    if specialty:
+        stmt = stmt.where(Chunk.specialty == specialty)
+    if nosology:
+        stmt = stmt.where(Chunk.nosology.ilike(f"%{nosology}%"))
+
+    return stmt
+
+
+def fetch_hits_for_fts(
+    *,
+    query_text: str,
+    top_k: int,
+    document_id: int | None = None,
+    source_id: str | None = None,
+    region: str | None = None,
+    specialty: str | None = None,
+    nosology: str | None = None,
+) -> list[RetrievalHit]:
+    query_text = " ".join((query_text or "").split())
+    if not query_text:
+        return []
+
+    stmt = build_fts_stmt(
+        query_text,
+        top_k=top_k,
+        document_id=document_id,
+        source_id=source_id,
+        region=region,
+        specialty=specialty,
+        nosology=nosology,
+    )
+
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+
+    hits: list[RetrievalHit] = []
+    for chunk, document, fts_rank in rows:
+        hits.append(
+            _hit_from_row(
+                chunk,
+                document,
+                distance=1.0,
+                retrieval_source="fts",
+                fts_rank=float(fts_rank or 0.0),
+            )
+        )
     return hits
 
 def merge_and_rerank_hits(
@@ -471,19 +632,38 @@ def merge_and_rerank_hits(
             new_sources = set(hit.retrieval_source or [])
             merged_sources = list(existing_sources | new_sources)
 
-            # оставляем лучший по distance hit
-            if hit.distance < existing.distance:
-                hit.retrieval_source = merged_sources
-                best_by_chunk_id[hit.chunk_id] = hit
+            existing_semantic = existing.semantic_score
+            if existing_semantic is None and "fts" not in (existing.retrieval_source or []):
+                existing_semantic = score_from_distance(existing.distance)
+            hit_semantic = hit.semantic_score
+            if hit_semantic is None and "fts" not in (hit.retrieval_source or []):
+                hit_semantic = score_from_distance(hit.distance)
+
+            # Keep the strongest semantic row as the primary row, but merge FTS evidence.
+            if (hit_semantic or -999.0) > (existing_semantic or -999.0):
+                primary, secondary = hit, existing
             else:
-                existing.retrieval_source = merged_sources
+                primary, secondary = existing, hit
+
+            primary.retrieval_source = merged_sources
+            primary.semantic_score = max(
+                existing_semantic if existing_semantic is not None else -999.0,
+                hit_semantic if hit_semantic is not None else -999.0,
+            )
+            if primary.semantic_score <= -999.0:
+                primary.semantic_score = None
+            primary.fts_rank = max(existing.fts_rank or 0.0, hit.fts_rank or 0.0) or None
+            primary.translated_chunk_text = primary.translated_chunk_text or secondary.translated_chunk_text
+            best_by_chunk_id[hit.chunk_id] = primary
 
     query_terms = extract_query_terms(query)
 
     merged_hits = list(best_by_chunk_id.values())
 
     for hit in merged_hits:
-        hit.score = rerank_score(hit, query_terms)
+        hit.score = rerank_score(hit, query_terms, query)
+        hit.hybrid_score = hit.score
+        hit.citation_confidence = citation_confidence(hit)
 
     merged_hits.sort(
         key=lambda x: (
@@ -509,6 +689,13 @@ def score_from_distance(distance: float) -> float:
     if score > 1.0:
         return 1.0
     return score
+
+
+def score_from_fts_rank(rank: float | None) -> float:
+    if rank is None or rank <= 0:
+        return 0.0
+    # ts_rank_cd is unbounded and corpus-dependent; compress it into [0, 1).
+    return float(rank) / (float(rank) + 1.0)
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-\+\.]{1,}")
 
@@ -596,6 +783,28 @@ def compute_lexical_overlap_bonus(hit: RetrievalHit, query_terms: list[str]) -> 
     return min(ratio * LEXICAL_OVERLAP_MAX_BONUS, LEXICAL_OVERLAP_MAX_BONUS)
 
 
+def compute_phrase_bonus(hit: RetrievalHit, query: str) -> float:
+    normalized_query = normalize_for_match(" ".join((query or "").split()))
+    if len(normalized_query) < 12 or len(normalized_query) > 180:
+        return 0.0
+    haystack = normalize_for_match(
+        " ".join(
+            filter(
+                None,
+                [
+                    hit.title,
+                    hit.section_title,
+                    hit.summary,
+                    hit.nosology,
+                    hit.specialty,
+                    hit.chunk_text,
+                ],
+            )
+        )
+    )
+    return PHRASE_MATCH_BONUS if normalized_query in haystack else 0.0
+
+
 def compute_section_bonus(hit: RetrievalHit) -> float:
     section = normalize_for_match(hit.section_title)
 
@@ -625,15 +834,35 @@ def compute_region_bonus(hit: RetrievalHit) -> float:
     return 0.0
 
 
-def rerank_score(hit: RetrievalHit, query_terms: list[str]) -> float:
-    base_score = score_from_distance(hit.distance)
+def rerank_score(hit: RetrievalHit, query_terms: list[str], query: str) -> float:
+    semantic_score = hit.semantic_score
+    if semantic_score is None and "fts" not in (hit.retrieval_source or []):
+        semantic_score = score_from_distance(hit.distance)
+    semantic_score = max(semantic_score or 0.0, 0.0)
+    fts_score = score_from_fts_rank(hit.fts_rank)
+
+    if semantic_score and fts_score:
+        base_score = (semantic_score * HYBRID_SEMANTIC_WEIGHT) + (fts_score * HYBRID_FTS_WEIGHT)
+    elif fts_score:
+        base_score = fts_score
+    else:
+        base_score = semantic_score
+
     final_score = (
         base_score
         + compute_region_bonus(hit)
         + compute_section_bonus(hit)
         + compute_lexical_overlap_bonus(hit, query_terms)
+        + compute_phrase_bonus(hit, query)
     )
+    if semantic_score and fts_score:
+        final_score += MULTI_SIGNAL_BONUS
     return final_score
+
+
+def citation_confidence(hit: RetrievalHit) -> float:
+    score = hit.hybrid_score if hit.hybrid_score is not None else hit.score
+    return max(0.0, min(float(score), 1.0))
 
 
 def limit_hits_per_document(
@@ -692,10 +921,53 @@ def translate_hits_if_needed(
     return result
 
 
+def attach_section_contexts(hits: list[RetrievalHit]) -> list[RetrievalHit]:
+    """Attach small neighboring-section context for hierarchical chunk grounding."""
+    if not hits or SECTION_CONTEXT_MAX_CHARS <= 0:
+        return hits
+
+    with session_scope() as session:
+        for hit in hits:
+            low = max(0, hit.chunk_index - 1)
+            high = hit.chunk_index + 1
+            stmt = (
+                select(Chunk)
+                .where(
+                    Chunk.document_id == hit.document_id,
+                    Chunk.chunk_index >= low,
+                    Chunk.chunk_index <= high,
+                )
+                .order_by(Chunk.chunk_index.asc())
+            )
+            if hit.section_title:
+                stmt = stmt.where(Chunk.section_title == hit.section_title)
+            else:
+                stmt = stmt.where(Chunk.section_title.is_(None))
+
+            neighbors = list(session.scalars(stmt))
+            parts: list[str] = []
+            for chunk in neighbors:
+                if chunk.id == hit.chunk_id:
+                    continue
+                text = (
+                    (chunk.summary or "").strip()
+                    or str((chunk.metadata_json or {}).get("display_text") or "").strip()
+                    or (chunk.chunk_text or "").strip()
+                )
+                if not text:
+                    continue
+                parts.append(f"chunk {chunk.chunk_index}: {text[:500]}")
+            if parts:
+                hit.section_context = "\n".join(parts)[:SECTION_CONTEXT_MAX_CHARS]
+
+    return hits
+
+
 def retrieve(
     query: str,
     *,
     top_k: int = 5,
+    retrieval_mode: RetrievalMode = RETRIEVAL_MODE,  # type: ignore[assignment]
     document_id: int | None = None,
     source_id: str | None = None,
     region: str | None = None,
@@ -722,6 +994,8 @@ def retrieve(
 
     query_translation: TranslationResult | None = None
     effective_query = raw_query
+    hybrid_enabled = retrieval_mode == "hybrid"
+    query_variants = decompose_query(raw_query)
 
     translator: YandexTranslateClient | None = None
     if translate_mode != "off":
@@ -735,29 +1009,47 @@ def retrieve(
 
     ru_hits: list[RetrievalHit] = []
     translated_hits: list[RetrievalHit] = []
+    fts_hits: list[RetrievalHit] = []
+
+    if hybrid_enabled:
+        for variant in query_variants:
+            fts_hits.extend(
+                fetch_hits_for_fts(
+                    query_text=variant,
+                    top_k=fts_candidate_top_k(top_k),
+                    document_id=document_id,
+                    source_id=source_id,
+                    region=region,
+                    specialty=specialty,
+                    nosology=nosology,
+                )
+            )
 
     if use_dual_query:
-        raw_query_embedding = get_query_embedding(
-            raw_query,
-            api_url=embeddings_api_url,
-            doc_model_uri=doc_model_uri,
-            query_model_uri=query_model_uri,
-            folder_id=folder_id,
-            api_key=api_key,
-            iam_token=iam_token,
-            debug=debug,
-        )
-        ru_hits = fetch_hits_for_embedding(
-            query_embedding=raw_query_embedding,
-            top_k=raw_candidate_top_k(top_k),
-            retrieval_source="ru_pass",
-            document_id=document_id,
-            source_id=source_id,
-            region=region,
-            specialty=specialty,
-            nosology=nosology,
-            per_source_k=per_source_k,
-        )
+        for variant in query_variants:
+            raw_query_embedding = get_query_embedding(
+                variant,
+                api_url=embeddings_api_url,
+                doc_model_uri=doc_model_uri,
+                query_model_uri=query_model_uri,
+                folder_id=folder_id,
+                api_key=api_key,
+                iam_token=iam_token,
+                debug=debug,
+            )
+            ru_hits.extend(
+                fetch_hits_for_embedding(
+                    query_embedding=raw_query_embedding,
+                    top_k=raw_candidate_top_k(top_k),
+                    retrieval_source="ru_pass",
+                    document_id=document_id,
+                    source_id=source_id,
+                    region=region,
+                    specialty=specialty,
+                    nosology=nosology,
+                    per_source_k=per_source_k,
+                )
+            )
 
         if translator is not None:
             query_translation = translator.translate(
@@ -792,6 +1084,7 @@ def retrieve(
         hits = merge_and_rerank_hits(
             ru_hits,
             translated_hits,
+            fts_hits,
             top_k=top_k,
             query=raw_query,
         )
@@ -805,35 +1098,42 @@ def retrieve(
             )
             effective_query = query_translation.translated_text
 
-        query_embedding = get_query_embedding(
-            effective_query,
-            api_url=embeddings_api_url,
-            doc_model_uri=doc_model_uri,
-            query_model_uri=query_model_uri,
-            folder_id=folder_id,
-            api_key=api_key,
-            iam_token=iam_token,
-            debug=debug,
-        )
+        vector_variants = decompose_query(effective_query)
+        vector_hits: list[RetrievalHit] = []
+        for variant in vector_variants:
+            query_embedding = get_query_embedding(
+                variant,
+                api_url=embeddings_api_url,
+                doc_model_uri=doc_model_uri,
+                query_model_uri=query_model_uri,
+                folder_id=folder_id,
+                api_key=api_key,
+                iam_token=iam_token,
+                debug=debug,
+            )
 
-        hits = fetch_hits_for_embedding(
-            query_embedding=query_embedding,
-            top_k=raw_candidate_top_k(top_k),
-            retrieval_source="translated_query" if query_translation is not None else "raw_query",
-            document_id=document_id,
-            source_id=source_id,
-            region=region,
-            specialty=specialty,
-            nosology=nosology,
-            per_source_k=per_source_k,
-        )
+            vector_hits.extend(
+                fetch_hits_for_embedding(
+                    query_embedding=query_embedding,
+                    top_k=raw_candidate_top_k(top_k),
+                    retrieval_source="translated_query" if query_translation is not None else "raw_query",
+                    document_id=document_id,
+                    source_id=source_id,
+                    region=region,
+                    specialty=specialty,
+                    nosology=nosology,
+                    per_source_k=per_source_k,
+                )
+            )
 
         hits = merge_and_rerank_hits(
-            hits,
+            vector_hits,
+            fts_hits,
             top_k=top_k,
             query=raw_query,
         )
 
+    hits = attach_section_contexts(hits)
     hits = translate_hits_if_needed(
         hits,
         translate_mode=translate_mode,
@@ -845,6 +1145,8 @@ def retrieve(
     return RetrievalResult(
         query=raw_query,
         effective_query=effective_query,
+        retrieval_mode=retrieval_mode,
+        query_variants=query_variants,
         translate_mode=translate_mode,
         translation_used=query_translation is not None,
         query_translation=query_translation,
@@ -857,6 +1159,8 @@ def format_hits_for_console(result: RetrievalResult) -> str:
     lines: list[str] = []
     lines.append(f"query={result.query!r}")
     lines.append(f"effective_query={result.effective_query!r}")
+    lines.append(f"retrieval_mode={result.retrieval_mode}")
+    lines.append(f"query_variants={result.query_variants!r}")
     lines.append(f"translate_mode={result.translate_mode}")
     lines.append(f"translation_used={result.translation_used}")
 
@@ -876,7 +1180,11 @@ def format_hits_for_console(result: RetrievalResult) -> str:
         lines.extend(
             [
                 "",
-                f"[{idx}] score={hit.score:.6f} distance={hit.distance:.6f} retrieval_sources={sources}",
+                (
+                    f"[{idx}] score={hit.score:.6f} distance={hit.distance:.6f} "
+                    f"fts_rank={hit.fts_rank or 0:.6f} confidence={hit.citation_confidence or 0:.3f} "
+                    f"retrieval_sources={sources}"
+                ),
                 f"source_id={hit.source_id} document_id={hit.document_id} chunk_id={hit.chunk_id}",
                 f"title={hit.title}",
                 f"section={hit.section_title}",
@@ -893,6 +1201,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("query", nargs="?", help="User question text.")
     parser.add_argument("--top-k", type=int, default=5, help="Number of chunks to return.")
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=["vector", "hybrid"],
+        default=RETRIEVAL_MODE,
+        help="Retrieval strategy: vector or hybrid (dense + Postgres FTS).",
+    )
     parser.add_argument("--document-id", type=int, help="Search only in one document.")
     parser.add_argument("--source-id", help="Search only in one source_id.")
     parser.add_argument("--region", help="Search only in one region.")
@@ -942,6 +1256,7 @@ def main() -> None:
     result = retrieve(
         args.query,
         top_k=args.top_k,
+        retrieval_mode=args.retrieval_mode,
         document_id=args.document_id,
         source_id=args.source_id,
         region=args.region,

@@ -58,9 +58,15 @@ def _build_context_text(sources: list[dict[str, Any]]) -> str:
         ).strip()
         summary = (src.get("summary") or "").strip()
         section = src.get("section_title") or ""
+        chunk_id = src.get("chunk_id")
+        confidence = src.get("citation_confidence")
         part = f"[{name}]"
         if section:
             part += f" {section}"
+        if chunk_id:
+            part += f" chunk_id={chunk_id}"
+        if confidence is not None:
+            part += f" confidence={confidence}"
         if summary:
             part += f"\nРезюме: {summary}"
         if text:
