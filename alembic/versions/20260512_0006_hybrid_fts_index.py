@@ -24,16 +24,13 @@ def upgrade() -> None:
         USING gin (
             to_tsvector(
                 'simple',
-                concat_ws(
-                    ' ',
-                    coalesce(section_title, ''),
-                    coalesce(summary, ''),
-                    coalesce(nosology, ''),
-                    coalesce(specialty, ''),
-                    coalesce(topic, ''),
-                    coalesce(evidence_level, ''),
-                    coalesce(chunk_text, '')
-                )
+                coalesce(section_title, '') || ' ' ||
+                coalesce(summary, '') || ' ' ||
+                coalesce(nosology, '') || ' ' ||
+                coalesce(specialty, '') || ' ' ||
+                coalesce(topic, '') || ' ' ||
+                coalesce(evidence_level, '') || ' ' ||
+                coalesce(chunk_text, '')
             )
         )
         """
