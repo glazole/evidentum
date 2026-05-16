@@ -3,3 +3,7 @@
 __pycache__
 .venv
 .env
+*.jpg
+*.pptx
+*.pdf
+_preview
