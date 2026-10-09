@@ -10,6 +10,15 @@ Published as a portfolio and research artifact. See [ARCHITECTURE.md](ARCHITECTU
 
 > Research and demonstration prototype, not a validated clinical decision support system. Generated answers may contain errors and must be checked against original sources. Do not use it as a substitute for professional clinical judgment.
 
+## Demo
+
+A silent walkthrough of the Evidentum interface.
+
+
+https://github.com/user-attachments/assets/80102e49-6e9d-42b4-8cab-580bfccea8ac
+
+
+
 ## What it does
 
 - Ingests PDF and HTML documents, extracts text, and creates chunks with source metadata.
