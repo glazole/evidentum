@@ -1,4 +1,4 @@
-*.example
+*.example_old
 *.ipynb
 __pycache__
 .venv
@@ -7,3 +7,5 @@ __pycache__
 *.pptx
 *.pdf
 _preview
+data/
+nginx/conf.d/app.conf
