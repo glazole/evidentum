@@ -80,7 +80,7 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Europe/Moscow}
-      UI_API_BASE_URL: http://mvp_api:8000/api
+      UI_API_BASE_URL: http://api:8000/api
     depends_on:
       api:
         condition: service_healthy
@@ -104,5 +104,4 @@ volumes:
 
 networks:
   mvp-net:
-    external: true
-    name: drug-code-resolver_mvp-net
+    driver: bridge
