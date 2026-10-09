@@ -112,7 +112,7 @@ Requires Docker Engine with Docker Compose v2. The default setup exposes the dat
 
 | Setting | Purpose |
 | --- | --- |
-| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | Compose database settings; the password is required and must be URL-safe |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | Compose database settings; preserves the original local defaults; custom passwords must be URL-safe |
 | `ADMIN_API_TOKEN` | Token required by administrative endpoints |
 | `UI_ADMIN_API_TOKEN` | Optional UI override; otherwise the UI uses `ADMIN_API_TOKEN` |
 | `YANDEX_FOLDER_ID`, `YANDEX_API_KEY` | Embeddings and default Yandex text generation |

@@ -27,7 +27,7 @@ the primary API/UI startup and the optional full HTTPS/Certbot deployment.
 ## Finish before changing visibility
 
 1. Apply the proposed packaging/documentation changes while the repository is private.
-2. Delete only the three explicitly named backup branches:
+2. The preparation script deletes only these backup branches from its new mirror:
    `backup_2026-04-17_19-28`, `backup_2026-04-18_18-24`,
    `backup-20260516-2238`. Feature, homelab and hardening branches are not backups
    by name and are not automatically deleted.
@@ -39,7 +39,8 @@ the primary API/UI startup and the optional full HTTPS/Certbot deployment.
      https://github.com/glazole/evidentum.git /path/to/new-release-directory
    ```
 
-4. Inspect the cleaned mirror and generated `push-reviewed-refs.sh`. The preparation
+4. Inspect the cleaned mirror and generated `push-reviewed-refs.sh`, which also
+   deletes those three remote backup refs when run. The preparation
    script never runs that push. Its generated command uses atomic updates and a
    separate force-with-lease condition for every branch/tag; a changed remote ref
    requires a fresh mirror and review. Keep `private-backup.bundle` private.

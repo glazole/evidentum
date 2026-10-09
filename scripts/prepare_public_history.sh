@@ -23,6 +23,14 @@ git -C "$mirror" bundle create "$release_dir/private-backup.bundle" --all
 git -C "$mirror" for-each-ref --format='%(refname) %(objectname)' \
   refs/heads refs/tags > "$release_dir/original-refs.txt"
 
+# Remove only the explicitly authorized backup branches from this new mirror.
+for branch in backup_2026-04-17_19-28 backup_2026-04-18_18-24 backup-20260516-2238; do
+  ref="refs/heads/$branch"
+  if git -C "$mirror" show-ref --verify --quiet "$ref"; then
+    git -C "$mirror" update-ref -d "$ref"
+  fi
+done
+
 # Globs match paths including nested directories and all historic PDF filenames.
 git -C "$mirror" filter-repo --force --invert-paths \
   --path-glob '*.[pP][dD][fF]'
@@ -48,7 +56,11 @@ push_script="$release_dir/push-reviewed-refs.sh"
     printf ' %q' "--force-with-lease=$ref:$old_sha"
   done < "$release_dir/original-refs.txt"
   while read -r ref old_sha; do
-    printf ' %q' "$ref:$ref"
+    if git -C "$mirror" show-ref --verify --quiet "$ref"; then
+      printf ' %q' "$ref:$ref"
+    else
+      printf ' %q' ":$ref"
+    fi
   done < "$release_dir/original-refs.txt"
   printf '\n'
 } > "$push_script"
