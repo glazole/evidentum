@@ -15,6 +15,12 @@ __pycache__/
 *.pyd
 *.so
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+letsencrypt/
+certbot/
 
 # venv
 .venv/

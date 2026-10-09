@@ -80,6 +80,9 @@ services:
   nginx:
     image: nginx:1.27-alpine
     container_name: mvp_nginx
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN for HTTPS deployment}
+      NGINX_ENVSUBST_FILTER: DOMAIN
     restart: unless-stopped
     depends_on:
       - api
@@ -88,7 +91,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
       - certbot_www:/var/www/certbot
       - letsencrypt:/etc/letsencrypt
     healthcheck:
@@ -125,3 +128,4 @@ networks:
     driver: bridge
   frontend:
     driver: bridge
+

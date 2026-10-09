@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-medguides}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       TZ: ${TZ:-Europe/Moscow}
     ports:
       - "127.0.0.1:55432:5432"
@@ -30,7 +30,7 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Europe/Moscow}
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-medguides}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-medguides}
     depends_on:
       db:
         condition: service_healthy
@@ -51,7 +51,7 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Europe/Moscow}
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-medguides}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-medguides}
     depends_on:
       db:
         condition: service_healthy
@@ -80,7 +80,7 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Europe/Moscow}
-      UI_API_BASE_URL: http://mvp_api:8000/api
+      UI_API_BASE_URL: http://api:8000/api
     depends_on:
       api:
         condition: service_healthy
@@ -104,5 +104,4 @@ volumes:
 
 networks:
   mvp-net:
-    external: true
-    name: drug-code-resolver_mvp-net
+    driver: bridge
